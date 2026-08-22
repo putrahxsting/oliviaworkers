@@ -34,6 +34,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.27.4'
           channel: 'stable'
           cache: true
 
@@ -127,16 +128,16 @@ jobs:
           FLUTTER_MINOR=$(echo "$FLUTTER_VERSION" | cut -d. -f2)
 
           if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ] 2>/dev/null; then
-            MIN_GRADLE="8.14.0"
+            MIN_GRADLE="8.13"
             MIN_AGP="8.7.0"
           elif [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 24 ] 2>/dev/null; then
-            MIN_GRADLE="8.10.0"
+            MIN_GRADLE="8.10.2"
             MIN_AGP="8.3.0"
           elif [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 22 ] 2>/dev/null; then
-            MIN_GRADLE="8.6.0"
+            MIN_GRADLE="8.6.1"
             MIN_AGP="8.1.0"
           else
-            MIN_GRADLE="8.14.0"
+            MIN_GRADLE="8.13"
             MIN_AGP="8.7.0"
           fi
 
@@ -147,7 +148,9 @@ jobs:
           if [ -f "$WRAPPER_FILE" ]; then
             CURRENT_GRADLE=$(grep -oP 'gradle-\K[0-9]+\.[0-9]+(\.[0-9]+)?' "$WRAPPER_FILE" | head -1)
             echo "Current Gradle: $CURRENT_GRADLE → Target: $MIN_GRADLE"
-            sed -i "s|gradle-${CURRENT_GRADLE}-|gradle-${MIN_GRADLE}-|g" "$WRAPPER_FILE"
+            # Ganti distributionUrl langsung ke versi yang valid
+            sed -i "s|gradle-${CURRENT_GRADLE}-bin|gradle-${MIN_GRADLE}-bin|g" "$WRAPPER_FILE"
+            sed -i "s|gradle-${CURRENT_GRADLE}-all|gradle-${MIN_GRADLE}-all|g" "$WRAPPER_FILE"
             echo "Updated gradle-wrapper.properties:"
             cat "$WRAPPER_FILE"
           fi
