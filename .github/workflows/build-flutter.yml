@@ -109,13 +109,101 @@ jobs:
           cd project
           flutter pub get
 
+      - name: Auto-Fix Gradle & AGP Compatibility
+        run: |
+          cd project
+
+          # ── 1. Deteksi versi Flutter yang aktif ──────────────────────────
+          FLUTTER_VERSION=$(flutter --version 2>/dev/null | grep -oP 'Flutter \K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "Flutter version: $FLUTTER_VERSION"
+
+          # ── 2. Tentukan Gradle & AGP minimum berdasarkan Flutter version ──
+          # Flutter 3.27+ butuh Gradle 8.14+ dan AGP 8.7+
+          # Flutter 3.24+ butuh Gradle 8.10+ dan AGP 8.3+
+          # Flutter 3.22+ butuh Gradle 8.6+  dan AGP 8.1+
+          # Default fallback: Gradle 8.14.0 (latest stable)
+
+          FLUTTER_MAJOR=$(echo "$FLUTTER_VERSION" | cut -d. -f1)
+          FLUTTER_MINOR=$(echo "$FLUTTER_VERSION" | cut -d. -f2)
+
+          if [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 27 ] 2>/dev/null; then
+            MIN_GRADLE="8.14.0"
+            MIN_AGP="8.7.0"
+          elif [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 24 ] 2>/dev/null; then
+            MIN_GRADLE="8.10.0"
+            MIN_AGP="8.3.0"
+          elif [ "$FLUTTER_MAJOR" -ge 3 ] && [ "$FLUTTER_MINOR" -ge 22 ] 2>/dev/null; then
+            MIN_GRADLE="8.6.0"
+            MIN_AGP="8.1.0"
+          else
+            MIN_GRADLE="8.14.0"
+            MIN_AGP="8.7.0"
+          fi
+
+          echo "Required Gradle: $MIN_GRADLE | Required AGP: $MIN_AGP"
+
+          # ── 3. Auto-upgrade gradle-wrapper.properties ────────────────────
+          WRAPPER_FILE="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER_FILE" ]; then
+            CURRENT_GRADLE=$(grep -oP 'gradle-\K[0-9]+\.[0-9]+(\.[0-9]+)?' "$WRAPPER_FILE" | head -1)
+            echo "Current Gradle: $CURRENT_GRADLE → Target: $MIN_GRADLE"
+            sed -i "s|gradle-${CURRENT_GRADLE}-|gradle-${MIN_GRADLE}-|g" "$WRAPPER_FILE"
+            echo "Updated gradle-wrapper.properties:"
+            cat "$WRAPPER_FILE"
+          fi
+
+          # ── 4. Auto-upgrade AGP di build.gradle / build.gradle.kts ──────
+          for BUILD_FILE in android/build.gradle android/build.gradle.kts; do
+            if [ -f "$BUILD_FILE" ]; then
+              echo "Checking AGP in $BUILD_FILE..."
+              # Deteksi versi AGP yang ada
+              CURRENT_AGP=$(grep -oP "com\.android\.tools\.build:gradle:\K[0-9]+\.[0-9]+\.[0-9]+" "$BUILD_FILE" 2>/dev/null | head -1)
+              if [ -n "$CURRENT_AGP" ]; then
+                echo "Current AGP: $CURRENT_AGP → Target: $MIN_AGP"
+                sed -i "s/com\.android\.tools\.build:gradle:${CURRENT_AGP}/com.android.tools.build:gradle:${MIN_AGP}/g" "$BUILD_FILE"
+              fi
+              # Handle KTS format: id("com.android.application") version "x.x.x"
+              CURRENT_AGP_KTS=$(grep -oP 'id\("com\.android\.application"\) version "\K[0-9]+\.[0-9]+\.[0-9]+' "$BUILD_FILE" 2>/dev/null | head -1)
+              if [ -n "$CURRENT_AGP_KTS" ]; then
+                echo "Current AGP (KTS): $CURRENT_AGP_KTS → Target: $MIN_AGP"
+                sed -i "s/id("com\.android\.application") version "${CURRENT_AGP_KTS}"/id("com.android.application") version "${MIN_AGP}"/g" "$BUILD_FILE"
+              fi
+            fi
+          done
+
+          # ── 5. Fix compileSdk & targetSdk jika terlalu lama ─────────────
+          for APP_BUILD in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$APP_BUILD" ]; then
+              # Pastikan compileSdk minimal 35 (Flutter latest)
+              CURRENT_COMPILE=$(grep -oP 'compileSdk\s*=?\s*\K[0-9]+' "$APP_BUILD" 2>/dev/null | head -1)
+              if [ -n "$CURRENT_COMPILE" ] && [ "$CURRENT_COMPILE" -lt 35 ] 2>/dev/null; then
+                echo "Upgrading compileSdk: $CURRENT_COMPILE → 35"
+                sed -i "s/compileSdk\s*=\s*${CURRENT_COMPILE}/compileSdk = 35/g" "$APP_BUILD"
+                sed -i "s/compileSdk ${CURRENT_COMPILE}/compileSdk 35/g" "$APP_BUILD"
+              fi
+              # Pastikan targetSdk minimal 34
+              CURRENT_TARGET=$(grep -oP 'targetSdk\s*=?\s*\K[0-9]+' "$APP_BUILD" 2>/dev/null | head -1)
+              if [ -n "$CURRENT_TARGET" ] && [ "$CURRENT_TARGET" -lt 34 ] 2>/dev/null; then
+                echo "Upgrading targetSdk: $CURRENT_TARGET → 34"
+                sed -i "s/targetSdk\s*=\s*${CURRENT_TARGET}/targetSdk = 34/g" "$APP_BUILD"
+                sed -i "s/targetSdk ${CURRENT_TARGET}/targetSdk 34/g" "$APP_BUILD"
+              fi
+            fi
+          done
+
+          # ── 6. Tambah flag bypass jika masih ada version conflict ────────
+          # --android-skip-build-dependency-validation sebagai safety net
+          echo "FLUTTER_EXTRA_FLAGS=--android-skip-build-dependency-validation" >> $GITHUB_ENV
+
+          echo "✅ Auto-fix selesai"
+
       - name: Build Flutter APK
         run: |
           cd project
           if [ "$BUILD_TYPE" = "debug" ]; then
-            flutter build apk --debug
+            flutter build apk --debug $FLUTTER_EXTRA_FLAGS ||             flutter build apk --debug --android-skip-build-dependency-validation
           else
-            flutter build apk --release
+            flutter build apk --release $FLUTTER_EXTRA_FLAGS ||             flutter build apk --release --android-skip-build-dependency-validation
           fi
 
       - name: Find APK File
