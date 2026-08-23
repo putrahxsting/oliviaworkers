@@ -261,11 +261,16 @@ jobs:
 
       - name: Flutter - Build APK
         if: env.PROJECT_TYPE == 'flutter'
+        id: flutter_build
         run: |
           cd "${{ env.PROJECT_DIR }}"
           echo "=== Building Flutter APK (${{ env.BUILD_TYPE }}) ==="
-          flutter build apk --${{ env.BUILD_TYPE }} \
-            --android-skip-build-dependency-validation
+          flutter build apk --${{ env.BUILD_TYPE }}             --android-skip-build-dependency-validation             2>&1 | tee /tmp/build_log.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED=true" >> $GITHUB_ENV
+            exit $EXIT_CODE
+          fi
 
       # ══════════════════════════════════════════
       # 7. NATIVE ANDROID: BUILD
@@ -283,10 +288,27 @@ jobs:
           echo "org.gradle.jvmargs=-Xmx4g"   >> ~/.gradle/gradle.properties
 
           if [ "${{ env.BUILD_TYPE }}" = "debug" ]; then
-            ./gradlew assembleDebug   --no-daemon --stacktrace
+            ./gradlew assembleDebug   --no-daemon --stacktrace 2>&1 | tee /tmp/build_log.txt
           else
-            ./gradlew assembleRelease --no-daemon --stacktrace
+            ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee /tmp/build_log.txt
           fi
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "BUILD_FAILED=true" >> $GITHUB_ENV
+            exit $EXIT_CODE
+          fi
+
+      # ══════════════════════════════════════════
+      # 7b. UPLOAD LOG JIKA BUILD GAGAL
+      # ══════════════════════════════════════════
+      - name: Upload Build Log on Failure
+        if: failure() && env.BUILD_FAILED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.event.inputs.jobId }}
+          path: /tmp/build_log.txt
+          if-no-files-found: warn
+          retention-days: 1
 
       # ══════════════════════════════════════════
       # 8. FIND APK & UPLOAD
