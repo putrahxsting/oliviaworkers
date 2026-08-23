@@ -302,7 +302,7 @@ jobs:
       # 7b. UPLOAD LOG JIKA BUILD GAGAL
       # ══════════════════════════════════════════
       - name: Upload Build Log on Failure
-        if: failure() && env.BUILD_FAILED == 'true'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ github.event.inputs.jobId }}
