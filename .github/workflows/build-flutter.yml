@@ -1,0 +1,337 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from Bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+
+      # ══════════════════════════════════════════
+      # 1. SETUP JAVA
+      # ══════════════════════════════════════════
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # ══════════════════════════════════════════
+      # 2. PARSE PAYLOAD & DOWNLOAD PROJECT
+      # ══════════════════════════════════════════
+      - name: Parse Payload & Download Project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PAYLOAD='${{ github.event.inputs.payload }}'
+          echo "Payload: $PAYLOAD"
+
+          URL=$(echo "$PAYLOAD" | jq -r '.url // empty')
+          ZIP_ASSET_URL=$(echo "$PAYLOAD" | jq -r '.zipAssetUrl // empty')
+          ZIP_RELEASE_TAG=$(echo "$PAYLOAD" | jq -r '.zipReleaseTag // empty')
+          APP_NAME=$(echo "$PAYLOAD" | jq -r '.appName // "MyApp"')
+          BUILD_TYPE=$(echo "$PAYLOAD" | jq -r '.buildType // "release"')
+
+          echo "APP_NAME=$APP_NAME"               >> $GITHUB_ENV
+          echo "BUILD_TYPE=$BUILD_TYPE"           >> $GITHUB_ENV
+          echo "ZIP_RELEASE_TAG=$ZIP_RELEASE_TAG" >> $GITHUB_ENV
+
+          mkdir -p project_raw
+
+          # ── Download ZIP ──
+          if [ -n "$ZIP_ASSET_URL" ]; then
+            echo "=== Mode: ZIP Asset ==="
+            curl -fsSL \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/octet-stream" \
+              "$ZIP_ASSET_URL" -o project.zip
+          elif [ -n "$URL" ]; then
+            echo "=== Mode: URL ==="
+            wget -q -O project.zip "$URL"
+          else
+            echo "❌ ERROR: Tidak ada URL atau ZIP_ASSET_URL di payload"
+            exit 1
+          fi
+
+          echo "=== File Info ==="
+          ls -lh project.zip
+          file project.zip
+
+          # ── Validasi ZIP ──
+          if ! unzip -t project.zip > /dev/null 2>&1; then
+            echo "❌ File bukan ZIP valid!"
+            cat project.zip | head -5
+            exit 1
+          fi
+
+          # ── Extract & Auto-detect root folder ──
+          unzip -q project.zip -d project_raw
+
+          SUB_DIRS=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILES=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+
+          if [ "$SUB_DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -1)
+            echo "✅ Nested folder: $PROJECT_DIR"
+          else
+            PROJECT_DIR="project_raw"
+            echo "✅ Root langsung: $PROJECT_DIR"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+          echo "=== Isi project ==="
+          ls -la "$PROJECT_DIR/"
+
+      # ══════════════════════════════════════════
+      # 3. DETEKSI TIPE & VERSI PROJECT
+      # ══════════════════════════════════════════
+      - name: Detect Project Type & Required Versions
+        run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+
+          # ── Deteksi tipe project ──
+          if [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            PROJECT_TYPE="flutter"
+            echo "✅ Flutter project"
+          elif find "$PROJECT_DIR" -name "gradlew" -type f | grep -q .; then
+            PROJECT_TYPE="android_native"
+            echo "✅ Native Android project"
+          else
+            echo "❌ Tipe project tidak dikenali"
+            ls -la "$PROJECT_DIR/"
+            exit 1
+          fi
+
+          echo "PROJECT_TYPE=$PROJECT_TYPE" >> $GITHUB_ENV
+
+          if [ "$PROJECT_TYPE" = "flutter" ]; then
+            # ── Baca Dart SDK dari pubspec.yaml ──
+            # Support berbagai format: ^3.8.1 | >=3.3.0 | >=3.3.0 <4.0.0 | ">=3.3.0 <4.0.0"
+            DART_LINE=$(grep -A3 'environment:' "$PROJECT_DIR/pubspec.yaml" | grep 'sdk:')
+            # Ambil versi minimum (angka pertama yang muncul)
+            DART_RAW=$(echo "$DART_LINE" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+            DART_MAJOR=$(echo "$DART_RAW" | cut -d. -f1)
+            DART_MINOR=$(echo "$DART_RAW" | cut -d. -f2)
+            DART_PATCH=$(echo "$DART_RAW" | cut -d. -f3)
+            echo "Dart SDK minimum: $DART_RAW (major=$DART_MAJOR minor=$DART_MINOR)"
+
+            # ── Map Dart minimum → Flutter version terbaru yang kompatibel ──
+            # Selalu pilih Flutter terbaru yang support Dart minimum tersebut
+            # Dart 3.8.x → Flutter 3.32.3 (Dart 3.8.0+)
+            # Dart 3.7.x → Flutter 3.29.3 (Dart 3.7.0+)
+            # Dart 3.6.x → Flutter 3.27.4 (Dart 3.6.0+)
+            # Dart 3.4.x → Flutter 3.24.5 (Dart 3.4.0+)
+            # Dart 3.3.x → Flutter 3.22.3 (Dart 3.3.0+)
+            # Dart 3.2.x → Flutter 3.22.3 (Dart 3.2.0+)
+            # Dart 3.0.x → Flutter 3.22.3
+            if [ "$DART_MAJOR" -ge 3 ] && [ "$DART_MINOR" -ge 8 ] 2>/dev/null; then
+              FLUTTER_VER="3.32.3"
+            elif [ "$DART_MAJOR" -ge 3 ] && [ "$DART_MINOR" -ge 7 ] 2>/dev/null; then
+              FLUTTER_VER="3.29.3"
+            elif [ "$DART_MAJOR" -ge 3 ] && [ "$DART_MINOR" -ge 6 ] 2>/dev/null; then
+              FLUTTER_VER="3.27.4"
+            elif [ "$DART_MAJOR" -ge 3 ] && [ "$DART_MINOR" -ge 4 ] 2>/dev/null; then
+              FLUTTER_VER="3.24.5"
+            elif [ "$DART_MAJOR" -ge 3 ] && [ "$DART_MINOR" -ge 0 ] 2>/dev/null; then
+              # Dart 3.0 - 3.3 → pakai Flutter terbaru yang backward compatible
+              FLUTTER_VER="3.32.3"
+            else
+              FLUTTER_VER="3.22.3"
+            fi
+
+            echo "✅ Flutter version dipilih: $FLUTTER_VER (Dart min: $DART_RAW)"
+            echo "FLUTTER_VER=$FLUTTER_VER" >> $GITHUB_ENV
+          fi
+
+          # ── Baca compileSdk dari build.gradle.kts ──
+          COMPILE_SDK=$(grep 'compileSdk' "$PROJECT_DIR/android/app/build.gradle.kts" 2>/dev/null \
+            | grep -o '[0-9]\+' | head -1)
+          [ -z "$COMPILE_SDK" ] && COMPILE_SDK=$(grep 'compileSdkVersion' "$PROJECT_DIR/android/app/build.gradle" 2>/dev/null \
+            | grep -o '[0-9]\+' | head -1)
+          [ -z "$COMPILE_SDK" ] && COMPILE_SDK="35"
+          echo "compileSdk: $COMPILE_SDK"
+          echo "COMPILE_SDK=$COMPILE_SDK" >> $GITHUB_ENV
+
+          # ── Map compileSdk → Gradle minimum (versi yang exist) ──
+          # compileSdk 36 → Gradle 8.13 (8.14 belum exist!)
+          # compileSdk 35 → Gradle 8.10.2
+          # compileSdk 34 → Gradle 8.6.1
+          # compileSdk 33 → Gradle 8.3
+          if [ "$COMPILE_SDK" -ge 36 ] 2>/dev/null; then
+            TARGET_GRADLE="8.13"
+          elif [ "$COMPILE_SDK" -ge 35 ] 2>/dev/null; then
+            TARGET_GRADLE="8.10.2"
+          elif [ "$COMPILE_SDK" -ge 34 ] 2>/dev/null; then
+            TARGET_GRADLE="8.6.1"
+          else
+            TARGET_GRADLE="8.3"
+          fi
+
+          echo "✅ Target Gradle: $TARGET_GRADLE"
+          echo "TARGET_GRADLE=$TARGET_GRADLE" >> $GITHUB_ENV
+
+      # ══════════════════════════════════════════
+      # 4. SETUP FLUTTER
+      # ══════════════════════════════════════════
+      - name: Setup Flutter
+        if: env.PROJECT_TYPE == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VER }}
+          channel: 'stable'
+          cache: true
+
+      # ══════════════════════════════════════════
+      # 5. AUTO-FIX GRADLE & SDK
+      # ══════════════════════════════════════════
+      - name: Auto-Fix Gradle & SDK Compatibility
+        run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+          TARGET_GRADLE="${{ env.TARGET_GRADLE }}"
+
+          WRAPPER="$PROJECT_DIR/android/gradle/wrapper/gradle-wrapper.properties"
+          if [ ! -f "$WRAPPER" ]; then
+            echo "⚠️ gradle-wrapper.properties tidak ditemukan, skip"
+            exit 0
+          fi
+
+          # Baca versi Gradle sekarang
+          CURRENT_GRADLE=$(grep distributionUrl "$WRAPPER" \
+            | grep -o 'gradle-[0-9][^-]*' | sed 's/gradle-//' | head -1)
+          echo "Gradle sekarang: $CURRENT_GRADLE"
+          echo "Gradle target:   $TARGET_GRADLE"
+
+          # Bandingkan versi — upgrade jika perlu
+          version_lt() {
+            # return 0 (true) jika $1 < $2
+            [ "$(printf '%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ] && [ "$1" != "$2" ]
+          }
+
+          if version_lt "$CURRENT_GRADLE" "$TARGET_GRADLE"; then
+            echo "⬆️ Upgrading Gradle: $CURRENT_GRADLE → $TARGET_GRADLE"
+            sed -i "s|gradle-${CURRENT_GRADLE}-bin|gradle-${TARGET_GRADLE}-bin|g" "$WRAPPER"
+            sed -i "s|gradle-${CURRENT_GRADLE}-all|gradle-${TARGET_GRADLE}-all|g" "$WRAPPER"
+            echo "=== gradle-wrapper.properties updated ==="
+            cat "$WRAPPER"
+          else
+            echo "✅ Gradle $CURRENT_GRADLE sudah kompatibel, tidak perlu upgrade"
+          fi
+
+          # Fix targetSdk jika terlalu lama (minimal 34)
+          for f in \
+            "$PROJECT_DIR/android/app/build.gradle" \
+            "$PROJECT_DIR/android/app/build.gradle.kts"; do
+            if [ -f "$f" ]; then
+              CUR=$(grep 'targetSdk' "$f" | grep -o '[0-9]\+' | head -1)
+              if [ -n "$CUR" ] && [ "$CUR" -lt 34 ] 2>/dev/null; then
+                echo "⬆️ targetSdk $CUR → 34 di $f"
+                sed -i "s/targetSdk = ${CUR}/targetSdk = 34/g" "$f"
+                sed -i "s/targetSdk ${CUR}/targetSdk 34/g" "$f"
+              fi
+            fi
+          done
+
+          echo "✅ Auto-fix selesai"
+
+      # ══════════════════════════════════════════
+      # 6. FLUTTER: PUB GET + BUILD
+      # ══════════════════════════════════════════
+      - name: Flutter - Get Dependencies
+        if: env.PROJECT_TYPE == 'flutter'
+        run: |
+          cd "${{ env.PROJECT_DIR }}"
+          flutter pub get
+
+      - name: Flutter - Build APK
+        if: env.PROJECT_TYPE == 'flutter'
+        run: |
+          cd "${{ env.PROJECT_DIR }}"
+          echo "=== Building Flutter APK (${{ env.BUILD_TYPE }}) ==="
+          flutter build apk --${{ env.BUILD_TYPE }} \
+            --android-skip-build-dependency-validation
+
+      # ══════════════════════════════════════════
+      # 7. NATIVE ANDROID: BUILD
+      # ══════════════════════════════════════════
+      - name: Native Android - Build APK
+        if: env.PROJECT_TYPE == 'android_native'
+        run: |
+          GRADLE_PATH=$(find "${{ env.PROJECT_DIR }}" -name "gradlew" -type f | head -1)
+          GRADLE_DIR=$(dirname "$GRADLE_PATH")
+          cd "$GRADLE_DIR"
+          chmod +x gradlew
+
+          mkdir -p ~/.gradle
+          echo "org.gradle.daemon=false"      >> ~/.gradle/gradle.properties
+          echo "org.gradle.jvmargs=-Xmx4g"   >> ~/.gradle/gradle.properties
+
+          if [ "${{ env.BUILD_TYPE }}" = "debug" ]; then
+            ./gradlew assembleDebug   --no-daemon --stacktrace
+          else
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          fi
+
+      # ══════════════════════════════════════════
+      # 8. FIND APK & UPLOAD
+      # ══════════════════════════════════════════
+      - name: Find APK
+        id: find_apk
+        run: |
+          PROJECT_DIR="${{ env.PROJECT_DIR }}"
+          BUILD_TYPE="${{ env.BUILD_TYPE }}"
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK=$(find "$PROJECT_DIR" -name "app-debug.apk" -type f 2>/dev/null | head -1)
+          else
+            APK=$(find "$PROJECT_DIR" -name "app-release*.apk" -type f 2>/dev/null | head -1)
+          fi
+          [ -z "$APK" ] && APK=$(find "$PROJECT_DIR" -name "*.apk" -type f 2>/dev/null | head -1)
+
+          if [ -z "$APK" ]; then
+            echo "❌ APK tidak ditemukan!"
+            find . -name "*.apk" 2>/dev/null || echo "Tidak ada .apk sama sekali"
+            exit 1
+          fi
+
+          SIZE=$(du -sh "$APK" | cut -f1)
+          echo "✅ APK ditemukan: $APK ($SIZE)"
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 1
+
+      # ══════════════════════════════════════════
+      # 9. CLEANUP RELEASE ASSET
+      # ══════════════════════════════════════════
+      - name: Cleanup Release Asset
+        if: always() && env.ZIP_RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ env.ZIP_RELEASE_TAG }}" ]; then
+            echo "Cleaning up release: ${{ env.ZIP_RELEASE_TAG }}"
+            gh release delete "${{ env.ZIP_RELEASE_TAG }}" \
+              --yes --repo ${{ github.repository }} 2>/dev/null || true
+          fi
