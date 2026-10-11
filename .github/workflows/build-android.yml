@@ -1,0 +1,1343 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  Web2Apk — Universal APK builder (Build Android APK)
+#  Satu workflow untuk semua tipe: Flutter • Cordova • Android native (Gradle).
+#  Tipe project dideteksi OTOMATIS dari isi ZIP, jadi ketiga file workflow
+#  (build-flutter / build-cordova / build-android) isinya sama dan aman dipakai
+#  oleh bot walau tipe yang ditebak bot salah.
+#
+#  Otomatis: pilih JDK 8/11/17/21, versi Flutter, versi Gradle (sesuai AGP),
+#  install Android SDK platform/build-tools/NDK yang kurang, terima lisensi,
+#  retry error jaringan/memori, sign APK release (keystore CI atau secrets
+#  ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS /
+#  ANDROID_KEY_PASSWORD), dan upload log LENGKAP (build-log-<jobId>) saat gagal.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Build Android APK
+run-name: "Web2Apk | ${{ inputs.jobId }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from Bot'
+        required: true
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
+
+permissions:
+  contents: write   # baca/hapus release asset ZIP sementara
+  actions: read
+
+defaults:
+  run:
+    shell: bash     # = bash -eo pipefail
+
+env:
+  W2A_HOME: /home/runner/w2a
+  W2A_LOG: /home/runner/w2a/logs/build_log.txt
+  TERM: dumb
+  NO_COLOR: '1'
+  CI: 'true'
+  FORCE_COLOR: '0'
+  ANDROID_SDK_ROOT_FALLBACK: /usr/local/lib/android/sdk
+  FLUTTER_SUPPRESS_ANALYTICS: 'true'
+  PUB_CACHE: /home/runner/.pub-cache
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CI toolkit (library)
+        run: |
+          mkdir -p "$W2A_HOME/logs" "$W2A_HOME/stages" "$W2A_HOME/out"
+          cat > "$W2A_HOME/lib.sh" <<'W2A_EOF_LIB_SH'
+          #!/usr/bin/env bash
+          # Web2Apk CI library — sourced by every workflow step.
+          # shellcheck shell=bash disable=SC2155
+
+          W2A_HOME="${W2A_HOME:-$HOME/w2a}"
+          W2A_LOG="${W2A_LOG:-$W2A_HOME/logs/build_log.txt}"
+          W2A_DETECT="$W2A_HOME/detect.js"
+          export W2A_HOME W2A_LOG
+
+          w2a_ts()      { date -u +%H:%M:%S; }
+          w2a_section() { printf '\n======== [%s] %s ========\n' "$(w2a_ts)" "$*"; }
+          w2a_info()    { printf '[w2a] %s\n' "$*"; }
+          w2a_warn()    { printf '::warning::[w2a] %s\n' "$*"; }
+          w2a_error()   { printf '::error::[w2a] %s\n' "$*"; }
+          w2a_die()     { w2a_error "$*"; exit 1; }
+          w2a_export()  { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_ENV"; export "$1=$2"; }
+          w2a_have()    { command -v "$1" >/dev/null 2>&1; }
+          w2a_vcmp()    { node "$W2A_DETECT" vcmp "$1" "$2"; }
+
+          # ── Android SDK ─────────────────────────────────────────────────────────────
+          w2a_sdkmanager_path() {
+            local p
+            for p in "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_HOME/tools/bin/sdkmanager"; do
+              [ -x "$p" ] && { echo "$p"; return 0; }
+            done
+            p=$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | sort -V | tail -1)
+            [ -n "$p" ] && { echo "$p"; return 0; }
+            return 1
+          }
+
+          # sdkmanager (new cmdline-tools) needs Java 17+ even when the project builds with JDK 8/11
+          w2a_sdkm() {
+            local sm jh
+            sm=$(w2a_sdkmanager_path) || { w2a_info "sdkmanager tidak ditemukan"; return 1; }
+            jh="${JAVA_HOME_17_X64:-${JAVA_HOME_21_X64:-${JAVA_HOME:-}}}"
+            JAVA_HOME="$jh" "$sm" --sdk_root="$ANDROID_HOME" "$@"
+          }
+
+          w2a_ensure_sdk() {
+            if [ -z "${ANDROID_HOME:-}" ] || [ ! -d "${ANDROID_HOME:-/nonexistent}" ]; then
+              local c
+              for c in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk "$HOME/Android/Sdk" "$HOME/android-sdk"; do
+                [ -n "$c" ] && [ -d "$c" ] && { ANDROID_HOME="$c"; break; }
+              done
+            fi
+            if [ -z "${ANDROID_HOME:-}" ] || [ ! -d "${ANDROID_HOME}" ]; then
+              w2a_info "Android SDK tidak ada di runner, mengunduh cmdline-tools..."
+              ANDROID_HOME="$HOME/android-sdk"
+              mkdir -p "$ANDROID_HOME/cmdline-tools"
+              curl -fsSL --retry 3 -o "$W2A_HOME/cmdtools.zip" \
+                "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+              unzip -q -o "$W2A_HOME/cmdtools.zip" -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            fi
+            if [ ! -w "$ANDROID_HOME" ]; then
+              w2a_info "SDK read-only, mengubah kepemilikan (sudo chown)"
+              sudo chown -R "$(id -u):$(id -g)" "$ANDROID_HOME" || true
+            fi
+            w2a_export ANDROID_HOME "$ANDROID_HOME"
+            w2a_export ANDROID_SDK_ROOT "$ANDROID_HOME"
+            echo "$ANDROID_HOME/platform-tools"  >> "$GITHUB_PATH"
+            echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+            w2a_info "ANDROID_HOME=$ANDROID_HOME"
+          }
+
+          w2a_accept_licenses() {
+            yes 2>/dev/null | w2a_sdkm --licenses >/dev/null 2>&1 || true
+          }
+
+          w2a_ensure_platform() {
+            local n="$1"
+            [ -n "$n" ] || return 0
+            if [ ! -d "$ANDROID_HOME/platforms/android-$n" ]; then
+              w2a_info "Menginstall platforms;android-$n"
+              w2a_sdkm "platforms;android-$n" >/dev/null 2>&1 || w2a_warn "gagal install platforms;android-$n"
+            fi
+          }
+
+          w2a_ensure_buildtools() {
+            local v="$1"
+            [ -n "$v" ] || return 0
+            if [ ! -d "$ANDROID_HOME/build-tools/$v" ]; then
+              w2a_info "Menginstall build-tools;$v"
+              w2a_sdkm "build-tools;$v" >/dev/null 2>&1 || w2a_warn "gagal install build-tools;$v"
+            fi
+          }
+
+          # ── Gradle environment ──────────────────────────────────────────────────────
+          w2a_write_gradle_env() {
+            mkdir -p "$HOME/.gradle/init.d"
+            cat > "$HOME/.gradle/gradle.properties" <<'EOF'
+          org.gradle.daemon=false
+          org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+          org.gradle.caching=false
+          org.gradle.vfs.watch=false
+          org.gradle.console=plain
+          kotlin.daemon.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          android.enableJetifier=true
+          android.overridePathCheck=true
+          android.suppressUnsupportedCompileSdk=34,35,36,37
+          systemProp.org.gradle.internal.http.connectionTimeout=180000
+          systemProp.org.gradle.internal.http.socketTimeout=180000
+          systemProp.org.gradle.internal.repository.max.retries=6
+          EOF
+            cp "$W2A_HOME/init.gradle" "$HOME/.gradle/init.d/web2apk.gradle"
+          }
+
+          w2a_ensure_gradle() {
+            w2a_have gradle && return 0
+            w2a_info "Gradle sistem tidak ada, mengunduh 8.10.2"
+            curl -fsSL --retry 3 -o "$W2A_HOME/gradle.zip" "https://services.gradle.org/distributions/gradle-8.10.2-bin.zip"
+            unzip -q -o "$W2A_HOME/gradle.zip" -d "$HOME/gradle-dist"
+            echo "$HOME/gradle-dist/gradle-8.10.2/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/gradle-dist/gradle-8.10.2/bin:$PATH"
+          }
+
+          # remove things that only make sense on the author's machine
+          w2a_sanitize_gradle_props() {
+            local f="$1/gradle.properties"
+            [ -f "$f" ] || return 0
+            sed -i -E '/^[[:space:]]*org\.gradle\.java\.home[[:space:]]*=/d;
+                       /^[[:space:]]*systemProp\.(http|https)\.(proxy|nonProxy)/d;
+                       /^[[:space:]]*org\.gradle\.daemon[[:space:]]*=/d' "$f"
+            # make sure the last line ends with newline
+            [ -n "$(tail -c1 "$f")" ] && echo >> "$f"
+            return 0
+          }
+
+          w2a_write_local_properties() {
+            local dir="$1" f
+            f="$dir/local.properties"
+            touch "$f"
+            sed -i -E '/^sdk\.dir=/d; /^ndk\.dir=/d; /^cmake\.dir=/d' "$f"
+            [ -n "$(tail -c1 "$f")" ] && echo >> "$f"
+            echo "sdk.dir=$ANDROID_HOME" >> "$f"
+          }
+
+          # Make sure a usable gradle wrapper exists and is new enough for the AGP in use.
+          # usage: w2a_fix_wrapper <gradleRoot> [minGradle]
+          w2a_fix_wrapper() {
+            local root="$1" min="${2:-}" props cur url target tmp
+            props="$root/gradle/wrapper/gradle-wrapper.properties"
+            w2a_ensure_gradle
+            mkdir -p "$root/gradle/wrapper"
+
+            cur=""
+            if [ -f "$props" ]; then
+              sed -i 's/\r$//' "$props"
+              url=$(grep -E '^distributionUrl=' "$props" | head -1 || true)
+              cur=$(printf '%s' "$url" | sed -nE 's/.*gradle-([0-9][0-9A-Za-z.]*(-(rc|milestone)-[0-9]+)?)-(bin|all)\.zip.*/\1/p')
+              if [ -n "$url" ] && ! printf '%s' "$url" | grep -qE '^distributionUrl=https?\\?:'; then
+                w2a_warn "distributionUrl custom/lokal ($url) -> diganti ke services.gradle.org"
+                cur=""
+              fi
+            fi
+
+            target="$cur"
+            if [ -z "$target" ]; then target="${min:-8.10.2}"; fi
+            if [ -n "$min" ] && [ -n "$cur" ] && [ "$(w2a_vcmp "$cur" "$min")" = "-1" ]; then
+              w2a_info "Gradle wrapper $cur < minimum $min untuk AGP project -> upgrade ke $min"
+              target="$min"
+            fi
+
+            if [ ! -f "$props" ] || [ "$target" != "$cur" ]; then
+              cat > "$props" <<EOF
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\\://services.gradle.org/distributions/gradle-${target}-bin.zip
+          networkTimeout=180000
+          validateDistributionUrl=false
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+              w2a_info "gradle-wrapper.properties -> gradle-${target}-bin.zip"
+            else
+              sed -i -E 's/^networkTimeout=.*/networkTimeout=180000/; /^distributionSha256Sum=/d' "$props"
+            fi
+
+            if [ ! -f "$root/gradlew" ] || [ ! -f "$root/gradle/wrapper/gradle-wrapper.jar" ]; then
+              w2a_info "gradlew / gradle-wrapper.jar tidak lengkap -> generate wrapper $target"
+              tmp=$(mktemp -d)
+              ( cd "$tmp" && gradle wrapper --gradle-version "$target" --distribution-type bin --no-daemon --console=plain )
+              [ -f "$root/gradlew" ] || cp "$tmp/gradlew" "$root/gradlew"
+              [ -f "$root/gradlew.bat" ] || cp "$tmp/gradlew.bat" "$root/gradlew.bat" 2>/dev/null || true
+              cp "$tmp/gradle/wrapper/gradle-wrapper.jar" "$root/gradle/wrapper/gradle-wrapper.jar"
+              rm -rf "$tmp"
+            fi
+            sed -i 's/\r$//' "$root/gradlew" 2>/dev/null || true
+            chmod +x "$root/gradlew"
+          }
+
+          # create key.properties / keystore.properties when the build script reads them but they are absent
+          w2a_ensure_keystore_props() {
+            local root="$1" name
+            for name in key.properties keystore.properties; do
+              if grep -rqs --include='*.gradle' --include='*.kts' "$name" "$root" 2>/dev/null && [ ! -f "$root/$name" ]; then
+                w2a_info "Build script membaca $name tapi file tidak ada -> dibuat dari keystore CI"
+                {
+                  echo "storePassword=$W2A_KS_PASS"
+                  echo "keyPassword=$W2A_KEY_PASS"
+                  echo "keyAlias=$W2A_KS_ALIAS"
+                  echo "storeFile=$W2A_KEYSTORE"
+                } > "$root/$name"
+              fi
+            done
+          }
+
+          # ── build runner with retries ───────────────────────────────────────────────
+          w2a_autofix() {
+            local f="$1" did=1 n v
+            if grep -qiE "licen[sc]es? (have|has) not been accepted|not accepted the licen|accept the SDK licen" "$f"; then
+              w2a_section "AUTO-FIX: menerima lisensi Android SDK"; w2a_accept_licenses; did=0
+            fi
+            for n in $(grep -oE "Failed to find target with hash string 'android-[0-9]+'|install Android target: \"android-[0-9]+\"|Android SDK Platform [0-9]+ is not installed" "$f" | grep -oE '[0-9]+' | sort -u); do
+              w2a_section "AUTO-FIX: install platform android-$n"; w2a_accept_licenses; w2a_ensure_platform "$n"; did=0
+            done
+            for v in $(grep -oE "Failed to find Build Tools revision [0-9.]+|install the Android build tools version [0-9.]+|build-tools;[0-9.]+" "$f" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -u); do
+              w2a_section "AUTO-FIX: install build-tools $v"; w2a_accept_licenses; w2a_ensure_buildtools "$v"; did=0
+            done
+            for v in $(grep -oE "No version of NDK matched the requested version [0-9.]+" "$f" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -u); do
+              w2a_section "AUTO-FIX: install ndk $v"; w2a_accept_licenses; w2a_sdkm "ndk;$v" >/dev/null 2>&1 || true; did=0
+            done
+            for v in $(grep -oE "CMake '[0-9.]+' was not found" "$f" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -u); do
+              w2a_section "AUTO-FIX: install cmake $v"; w2a_accept_licenses; w2a_sdkm "cmake;$v" >/dev/null 2>&1 || true; did=0
+            done
+            if grep -qE "Could not (GET|HEAD|resolve|download)|Read timed out|Connection (reset|timed out)|Remote host (terminated|closed)|Premature end of Content-Length|Received status code 5[0-9][0-9]|Unable to tunnel|Could not install Gradle distribution|SocketTimeout|UnknownHost|TLS handshake|Network is unreachable|Failed host lookup|Gateway Time-?out|Server returned HTTP response code: 5" "$f"; then
+              w2a_section "AUTO-FIX: masalah jaringan sementara, tunggu 15 detik lalu coba lagi"; sleep 15; did=0
+            fi
+            if grep -qE "OutOfMemoryError|GC overhead limit|Java heap space|Metaspace|Gradle build daemon disappeared|Daemon will be stopped at the end of the build after running out of JVM memory|Expiring Daemon" "$f"; then
+              w2a_section "AUTO-FIX: memori Gradle habis, naikkan heap & matikan paralel"
+              sed -i -E 's/^org\.gradle\.jvmargs=.*/org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=2g -Dfile.encoding=UTF-8/' "$HOME/.gradle/gradle.properties"
+              echo "org.gradle.parallel=false" >> "$HOME/.gradle/gradle.properties"
+              did=0
+            fi
+            if grep -qiE "keystore file .* not found|Keystore file '.*' not found for signing config|keystore.*(does not exist|not found)|Failed to read key .* from store|Cannot recover key|keystore was tampered|java\.io\.FileNotFoundException:.*(keystore|\.jks)" "$f"; then
+              if [ "${W2A_FORCE_KEYSTORE:-0}" != "1" ]; then
+                w2a_section "AUTO-FIX: keystore project hilang/invalid -> pakai keystore CI"
+                w2a_export W2A_FORCE_KEYSTORE 1; did=0
+              fi
+            fi
+            if grep -qE "Could not (initialize|find or load main) class|Unsupported class file major version|Unsupported major\.minor version|Could not create service of type|incompatible with .*(Java|JVM)|requires Java [0-9]+|Android Gradle plugin requires Java [0-9]+" "$f"; then
+              w2a_info "Terdeteksi indikasi JDK tidak cocok (lihat DIAGNOSIS di bot)."
+            fi
+            return $did
+          }
+
+          # usage: w2a_retry <label> <command...>   (command is run with its own cwd handling)
+          w2a_retry() {
+            local label="$1"; shift
+            local max="${W2A_MAX_ATTEMPTS:-3}" attempt=1 att rc
+            att="$W2A_HOME/logs/attempt.txt"
+            while :; do
+              w2a_section "$label (percobaan $attempt/$max)"
+              : > "$att"
+              set +e
+              "$@" 2>&1 | tee "$att"
+              rc=${PIPESTATUS[0]}
+              set -e
+              if [ "$rc" -eq 0 ]; then return 0; fi
+              w2a_info "$label gagal (exit code $rc)"
+              if [ "$attempt" -ge "$max" ]; then return "$rc"; fi
+              if w2a_autofix "$att"; then attempt=$((attempt + 1)); continue; fi
+              return "$rc"
+            done
+          }
+
+          # ── APK helpers ─────────────────────────────────────────────────────────────
+          # prints the best APK path inside <dir> for $BUILD_TYPE, or nothing
+          w2a_pick_apk() {
+            local dir="$1" best="" line
+            best=$(
+              find "$dir" -type f -name '*.apk' \
+                -not -path '*/androidTest/*' -not -path '*/intermediates/*' -not -path '*/node_modules/*' \
+                -not -name '*androidTest*' -not -name '*-aligned*' -printf '%s\t%p\n' 2>/dev/null |
+              while IFS=$'\t' read -r size path; do
+                score=0
+                case "$path" in *"/$BUILD_TYPE/"*|*"-$BUILD_TYPE"*) score=$((score + 2));; esac
+                case "$path" in */outputs/*|*/flutter-apk/*) score=$((score + 1));; esac
+                printf '%s\t%s\t%s\n' "$score" "$size" "$path"
+              done | sort -t$'\t' -k1,1nr -k2,2nr | head -1 | cut -f3
+            ) || true
+            line="$best"
+            if [ -n "$line" ]; then printf '%s\n' "$line"; fi
+            return 0
+          }
+
+          w2a_buildtool() {   # newest build-tools binary: w2a_buildtool apksigner|zipalign|aapt
+            local t="$1" p
+            p=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name "$t" -type f 2>/dev/null | sort -V | tail -1)
+            if [ -n "$p" ]; then echo "$p"; fi
+            return 0
+          }
+          W2A_EOF_LIB_SH
+          chmod +x "$W2A_HOME/lib.sh"
+          cat > "$W2A_HOME/init.gradle" <<'W2A_EOF_INIT_GRADLE'
+          // Web2Apk CI — Gradle init script (applied to every build: native, Flutter, Cordova)
+          // 1. never let lint abort a CI build
+          // 2. optionally force the CI keystore on the "release" signing config (retry path)
+          def w2aForceKs = System.getenv('W2A_FORCE_KEYSTORE') == '1'
+          def w2aKsFile  = System.getenv('W2A_KEYSTORE')
+
+          allprojects { proj ->
+              proj.afterEvaluate { p ->
+                  def android = p.extensions.findByName('android')
+                  if (android == null) return
+
+                  try { android.lintOptions { abortOnError false; checkReleaseBuilds false } } catch (Throwable ignored) { }
+                  try { android.lint { abortOnError = false; checkReleaseBuilds = false } } catch (Throwable ignored) { }
+
+                  if (w2aForceKs && w2aKsFile) {
+                      try {
+                          def sc = android.signingConfigs.findByName('release')
+                          if (sc != null) {
+                              sc.storeFile     = new File(w2aKsFile)
+                              sc.storePassword = System.getenv('W2A_KS_PASS')
+                              sc.keyAlias      = System.getenv('W2A_KS_ALIAS')
+                              sc.keyPassword   = System.getenv('W2A_KEY_PASS')
+                          }
+                      } catch (Throwable ignored) { }
+                  }
+              }
+          }
+          W2A_EOF_INIT_GRADLE
+          cat > "$W2A_HOME/detect.js" <<'W2A_EOF_DETECT_JS'
+          #!/usr/bin/env node
+          /* Web2Apk CI helper — project detection & version planning.
+           * Zero dependencies. Usage:
+           *   node detect.js detect  <dir>            -> JSON (type, root, versions...)
+           *   node detect.js android <gradleRootDir>  -> JSON (gradle/agp/compileSdk/java)
+           *   node detect.js cordova-java <major>     -> JDK major for a cordova-android major
+           *   node detect.js cordova-java-agp <agp>   -> JDK major from an AGP version
+           *   node detect.js gradle-min <agp>         -> minimum Gradle for an AGP version
+           */
+          'use strict';
+          const fs = require('fs');
+          const path = require('path');
+
+          const SKIP_DIRS = new Set([
+            'node_modules', '.git', '.dart_tool', '.gradle', 'build', 'Pods', '__MACOSX', '.idea',
+            '.pub-cache', '.symlinks', 'platforms', 'plugins', '.fvm', '.svn', '.hg', 'DerivedData',
+          ]);
+
+          function read(file, max = 2 * 1024 * 1024) {
+            try {
+              const st = fs.statSync(file);
+              if (st.size > max) return fs.readFileSync(file, 'utf8').slice(0, max);
+              return fs.readFileSync(file, 'utf8');
+            } catch (_) { return ''; }
+          }
+
+          function walk(root, maxDepth = 7) {
+            const out = [];
+            const stack = [{ dir: root, depth: 0 }];
+            while (stack.length) {
+              const { dir, depth } = stack.pop();
+              let entries;
+              try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { continue; }
+              for (const e of entries) {
+                const abs = path.join(dir, e.name);
+                if (e.isDirectory()) {
+                  if (SKIP_DIRS.has(e.name) || depth + 1 > maxDepth) continue;
+                  stack.push({ dir: abs, depth: depth + 1 });
+                } else if (e.isFile()) {
+                  out.push({ abs, dir, name: e.name, depth });
+                }
+              }
+            }
+            out.sort((a, b) => a.depth - b.depth || a.abs.localeCompare(b.abs));
+            return out;
+          }
+
+          // ── version helpers ────────────────────────────────────────────────────────
+          function vparse(v) {
+            const m = String(v || '').match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+            if (!m) return null;
+            return [parseInt(m[1], 10), parseInt(m[2] || '0', 10), parseInt(m[3] || '0', 10)];
+          }
+          function vcmp(a, b) {
+            const x = Array.isArray(a) ? a : vparse(a);
+            const y = Array.isArray(b) ? b : vparse(b);
+            if (!x || !y) return 0;
+            for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+            return 0;
+          }
+
+          // Android Gradle Plugin -> minimum Gradle (official compatibility table)
+          const AGP_GRADLE = [
+            ['9.0', '9.1.0'], ['8.13', '8.13'], ['8.12', '8.13'], ['8.11', '8.13'], ['8.10', '8.11.1'],
+            ['8.9', '8.11.1'], ['8.8', '8.10.2'], ['8.7', '8.9'], ['8.6', '8.7'], ['8.5', '8.7'],
+            ['8.4', '8.6'], ['8.3', '8.4'], ['8.2', '8.2'], ['8.1', '8.0'], ['8.0', '8.0'],
+            ['7.4', '7.5'], ['7.3', '7.4'], ['7.2', '7.3.3'], ['7.1', '7.2'], ['7.0', '7.0'],
+            ['4.2', '6.7.1'], ['4.1', '6.5'], ['4.0', '6.1.1'], ['3.6', '5.6.4'], ['3.5', '5.4.1'],
+            ['3.4', '5.1.1'], ['3.3', '4.10.1'], ['3.2', '4.6'], ['3.1', '4.4'], ['3.0', '4.1'],
+          ];
+          function gradleMinForAgp(agp) {
+            const v = vparse(agp);
+            if (!v) return null;
+            for (const [a, g] of AGP_GRADLE) {
+              const av = vparse(a);
+              if (v[0] > av[0] || (v[0] === av[0] && v[1] >= av[1])) return g;
+            }
+            return '4.1';
+          }
+
+          // ── JDK planning ───────────────────────────────────────────────────────────
+          function javaForGradle(gradleVersion, agp, hint21) {
+            let g = gradleVersion;
+            const gmin = gradleMinForAgp(agp);
+            if (gmin && (!g || vcmp(g, gmin) < 0)) g = gmin;   // we will bump the wrapper to this
+            if (hint21 && (!g || vcmp(g, '8.5') >= 0)) return 21;
+            if (!g) return 17;
+            if (vcmp(g, '6.0') < 0) return 8;
+            if (vcmp(g, '7.3') < 0) return 11;
+            return 17;
+          }
+          function javaForCordovaMajor(major) {
+            const m = parseInt(major, 10);
+            if (!m) return 17;
+            if (m <= 9) return 8;
+            if (m === 10) return 11;
+            return 17;
+          }
+          function javaForAgp(agp) {
+            const v = vparse(agp);
+            if (!v) return 17;
+            if (v[0] >= 7) return 17;
+            if (v[0] === 4) return 11;
+            return 8;
+          }
+
+          // ── Flutter planning ───────────────────────────────────────────────────────
+          // Dart minor line -> Flutter minor line (newest patch resolved by "x")
+          const DART_TO_FLUTTER = [
+            [[3, 9], '3.35.x'], [[3, 8], '3.32.x'], [[3, 7], '3.29.x'], [[3, 6], '3.27.x'], [[3, 5], '3.24.x'],
+            [[3, 4], '3.22.x'], [[3, 3], '3.19.x'], [[3, 2], '3.16.x'], [[3, 1], '3.13.x'], [[3, 0], '3.10.x'],
+            [[2, 19], '3.7.x'], [[2, 18], '3.3.x'], [[2, 17], '3.0.x'], [[2, 16], '2.10.x'], [[2, 15], '2.8.x'],
+            [[2, 14], '2.5.x'], [[2, 13], '2.2.x'], [[2, 12], '2.0.x'],
+          ];
+          const FLUTTER_CAP_DART = [3, 9];       // newest line we trust by default (Flutter 3.35)
+
+          function parseConstraint(str) {
+            const s = String(str || '').trim().replace(/^['"]|['"]$/g, '');
+            const res = { lo: null, hi: null };
+            if (!s || s === 'any') return res;
+            const caret = s.match(/^\^\s*(\d+(?:\.\d+){0,2})/);
+            if (caret) {
+              const lo = vparse(caret[1]);
+              res.lo = lo;
+              res.hi = lo[0] > 0 ? [lo[0] + 1, 0, 0] : [0, lo[1] + 1, 0];
+              return res;
+            }
+            const ge = s.match(/>=\s*(\d+(?:\.\d+){0,2})/);
+            const gt = s.match(/>\s*(\d+(?:\.\d+){0,2})/);
+            const lt = s.match(/<\s*(\d+(?:\.\d+){0,2})/);
+            const le = s.match(/<=\s*(\d+(?:\.\d+){0,2})/);
+            if (ge) res.lo = vparse(ge[1]); else if (gt) res.lo = vparse(gt[1]);
+            if (le) { const h = vparse(le[1]); res.hi = [h[0], h[1], h[2] + 1]; }
+            else if (lt) res.hi = vparse(lt[1]);
+            if (!ge && !gt && !lt && !le) {
+              const exact = vparse(s);
+              if (exact) { res.lo = exact; }
+            }
+            return res;
+          }
+
+          function envBlock(pubspec) {
+            const m = pubspec.match(/^environment:[ \t]*\r?\n((?:[ \t]+[^\r\n]*\r?\n?|[ \t]*\r?\n)*)/m);
+            return m ? m[1] : '';
+          }
+
+          function planFlutter(rootDir, maxDart) {
+            const pubspec = read(path.join(rootDir, 'pubspec.yaml'));
+            const env = envBlock(pubspec);
+            const name = (pubspec.match(/^name:\s*['"]?([A-Za-z0-9_]+)/m) || [])[1] || 'app';
+            const sdkStr = (env.match(/^[ \t]+sdk:\s*([^\r\n#]+)/m) || [])[1];
+            const flStr = (env.match(/^[ \t]+flutter:\s*([^\r\n#]+)/m) || [])[1];
+            const dart = parseConstraint(sdkStr);
+            const fl = parseConstraint(flStr);
+
+            let plan = { version: '3.35.x', source: 'default', dartConstraint: sdkStr ? sdkStr.trim() : null };
+
+            // 1. explicit pin (FVM)
+            let pin = null;
+            const fvmrc = read(path.join(rootDir, '.fvmrc'));
+            if (fvmrc) { try { pin = JSON.parse(fvmrc).flutter; } catch (_) { /* ignore */ } }
+            if (!pin) {
+              const legacy = read(path.join(rootDir, '.fvm', 'fvm_config.json'));
+              if (legacy) { try { pin = JSON.parse(legacy).flutterSdkVersion; } catch (_) { /* ignore */ } }
+            }
+            if (pin) {
+              pin = String(pin).split('@')[0].trim();
+              if (/^\d+\.\d+\.\d+$/.test(pin)) return Object.assign(plan, { version: pin, source: 'fvm', name });
+              if (/^(stable|beta|master|main)$/.test(pin)) return Object.assign(plan, { version: 'stable', source: 'fvm', name });
+            }
+
+            // 2. dart constraint
+            if (dart.lo && (dart.lo[0] > FLUTTER_CAP_DART[0] ||
+                (dart.lo[0] === FLUTTER_CAP_DART[0] && dart.lo[1] > FLUTTER_CAP_DART[1]))) {
+              plan = { version: 'stable', source: 'dart>=' + dart.lo.join('.'), dartConstraint: plan.dartConstraint };
+            } else {
+              let chosen = null;
+              for (const [d, f] of DART_TO_FLUTTER) {
+                if (vcmp([d[0], d[1], 0], [FLUTTER_CAP_DART[0], FLUTTER_CAP_DART[1], 0]) > 0) continue;
+                // old Android scaffold (AGP 4.x / 7.x) -> do not jump to a Flutter that dropped it,
+                // unless the Dart constraint of the project itself demands a newer SDK
+                if (maxDart && !(dart.lo && vcmp(dart.lo, [maxDart[0], maxDart[1], 99]) > 0) &&
+                    vcmp([d[0], d[1], 0], [maxDart[0], maxDart[1], 0]) > 0) continue;
+                if (dart.lo && vcmp([d[0], d[1], 99], dart.lo) < 0) continue;          // too old for lower bound
+                if (dart.hi && vcmp([d[0], d[1], 0], dart.hi) >= 0) continue;          // not below upper bound
+                chosen = f; break;                                                     // newest first
+              }
+              if (chosen) plan = { version: chosen, source: 'dart-constraint', dartConstraint: plan.dartConstraint };
+              else if (dart.hi && dart.hi[0] < 3) plan = { version: '2.10.x', source: 'dart-legacy', dartConstraint: plan.dartConstraint };
+            }
+
+            // 3. "environment: flutter: >=x" lower bound
+            if (fl.lo && plan.version !== 'stable') {
+              const cur = vparse(plan.version.replace(/\.x$/, '.0'));
+              if (cur && vcmp(cur, [fl.lo[0], fl.lo[1], 0]) < 0) {
+                plan.version = (vcmp([fl.lo[0], fl.lo[1], 0], [3, 35, 0]) > 0) ? 'stable' : `${fl.lo[0]}.${fl.lo[1]}.x`;
+                plan.source = 'flutter-constraint';
+              }
+            }
+            plan.name = name;
+            return plan;
+          }
+
+          function flutterFlavors(androidDir) {
+            const out = [];
+            for (const f of ['app/build.gradle', 'app/build.gradle.kts']) {
+              const t = read(path.join(androidDir, f));
+              const m = t.match(/productFlavors\s*\{/);
+              if (!m) continue;
+              // crude brace matching
+              let i = m.index + m[0].length, depth = 1, body = '';
+              while (i < t.length && depth > 0) {
+                const c = t[i++];
+                if (c === '{') depth++;
+                else if (c === '}') { depth--; if (depth === 0) break; }
+                body += c;
+              }
+              // only top-level names inside the productFlavors block
+              let d = 0, buf = '';
+              for (const c of body) {
+                if (c === '{') { if (d === 0) { const nm = buf.match(/(?:create|register|getByName)?\s*\(?\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*\)?\s*$/); if (nm) out.push(nm[1]); } d++; buf = ''; }
+                else if (c === '}') { d--; buf = ''; }
+                else if (d === 0) buf += c;
+              }
+              if (out.length) break;
+            }
+            return out.filter((v, i, a) => a.indexOf(v) === i);
+          }
+
+          // ── Android (native gradle) info ───────────────────────────────────────────
+          function androidInfo(rootDir) {
+            const info = {
+              root: rootDir, hasGradlew: false, hasWrapperJar: false, hasWrapperProps: false,
+              gradleVersion: null, distributionCustom: false, agp: null, compileSdk: null, targetSdk: null,
+              minSdk: null, java21: false, appModules: [], keystoreProps: [], javaVersion: 17, gradleMin: null,
+            };
+            info.hasGradlew = fs.existsSync(path.join(rootDir, 'gradlew'));
+            info.hasWrapperJar = fs.existsSync(path.join(rootDir, 'gradle', 'wrapper', 'gradle-wrapper.jar'));
+            const props = read(path.join(rootDir, 'gradle', 'wrapper', 'gradle-wrapper.properties'));
+            if (props) {
+              info.hasWrapperProps = true;
+              const m = props.match(/distributionUrl\s*=\s*(.+)/);
+              if (m) {
+                const url = m[1].trim();
+                const gv = url.match(/gradle-([0-9][0-9A-Za-z.\-]*?)-(?:bin|all)\.zip/);
+                if (gv) info.gradleVersion = gv[1];
+                if (!/^https?\\?:\\?\/\\?\/services\.gradle\.org/.test(url) && !/^https?/.test(url.replace(/\\/g, ''))) info.distributionCustom = true;
+              }
+            }
+
+            const agps = [];
+            const files = walk(rootDir, 4).filter(f =>
+              /\.(gradle|kts|toml|properties)$/.test(f.name) && !/node_modules/.test(f.abs));
+            let compile = 0, target = 0, minsdk = 0;
+            for (const f of files) {
+              const t = read(f.abs, 512 * 1024);
+              let m;
+              const re1 = /com\.android\.tools\.build:gradle:([0-9][0-9A-Za-z.\-]*)/g;
+              while ((m = re1.exec(t))) agps.push(m[1]);
+              const re2 = /com\.android\.(?:application|library)["')\s]+version\s*\(?\s*["']([0-9][0-9A-Za-z.\-]*)["']/g;
+              while ((m = re2.exec(t))) agps.push(m[1]);
+              if (f.name.endsWith('.toml')) {
+                const m3 = t.match(/^\s*(?:agp|android-gradle-plugin|androidGradlePlugin)\s*=\s*["']([0-9][0-9A-Za-z.\-]*)["']/m);
+                if (m3) agps.push(m3[1]);
+              }
+              if (/build\.gradle(\.kts)?$/.test(f.name)) {
+                const c = t.match(/compileSdk(?:Version)?\s*(?:=|\(|\s)\s*(?:["']android-)?(\d{2})/);
+                if (c) compile = Math.max(compile, parseInt(c[1], 10));
+                const tg = t.match(/targetSdk(?:Version)?\s*(?:=|\(|\s)\s*(\d{2})/);
+                if (tg) target = Math.max(target, parseInt(tg[1], 10));
+                const mn = t.match(/minSdk(?:Version)?\s*(?:=|\(|\s)\s*(\d{2})/);
+                if (mn) minsdk = minsdk ? Math.min(minsdk, parseInt(mn[1], 10)) : parseInt(mn[1], 10);
+                if (/com\.android\.application|apply plugin:\s*['"]com\.android\.application['"]/.test(t) && !/apply\s+false/.test(t.split('\n').filter(l => /com\.android\.application/.test(l)).join('\n'))) {
+                  info.appModules.push(path.relative(rootDir, f.dir) || '.');
+                }
+                if (/VERSION_21|jvmToolchain\s*\(\s*21|JavaLanguageVersion\.of\(\s*21|jvmTarget\s*=?\s*["']21/.test(t)) info.java21 = true;
+                const kp = t.match(/(keystore|key)\.properties/);
+                if (kp) info.keystoreProps.push(kp[0]);
+              }
+            }
+            if (agps.length) info.agp = agps.sort((a, b) => vcmp(b, a))[0].replace(/-.*/, '');
+            info.compileSdk = compile || null;
+            info.targetSdk = target || null;
+            info.minSdk = minsdk || null;
+            info.gradleMin = gradleMinForAgp(info.agp);
+            info.javaVersion = javaForGradle(info.gradleVersion, info.agp, info.java21);
+            info.keystoreProps = info.keystoreProps.filter((v, i, a) => a.indexOf(v) === i);
+            return info;
+          }
+
+          // ── Cordova info ───────────────────────────────────────────────────────────
+          function cordovaInfo(rootDir) {
+            const cfg = read(path.join(rootDir, 'config.xml'));
+            const pkgTxt = read(path.join(rootDir, 'package.json'));
+            let pkg = {};
+            try { pkg = JSON.parse(pkgTxt || '{}'); } catch (_) { /* ignore */ }
+            const eng = cfg.match(/<engine\s+[^>]*name\s*=\s*["']android["'][^>]*spec\s*=\s*["']([^"']+)["']/i) ||
+                        cfg.match(/<engine\s+[^>]*spec\s*=\s*["']([^"']+)["'][^>]*name\s*=\s*["']android["']/i);
+            const deps = Object.assign({}, pkg.dependencies, pkg.devDependencies);
+            const cli = deps.cordova ? (String(deps.cordova).match(/(\d+)/) || [])[1] : null;
+            const target = cfg.match(/name\s*=\s*["']android-targetSdkVersion["']\s+value\s*=\s*["'](\d+)["']/i);
+            const minsdk = cfg.match(/name\s*=\s*["']android-minSdkVersion["']\s+value\s*=\s*["'](\d+)["']/i);
+            return {
+              androidSpec: eng ? eng[1] : (deps['cordova-android'] || null),
+              cliMajor: cli,
+              targetSdkPref: target ? parseInt(target[1], 10) : null,
+              minSdkPref: minsdk ? parseInt(minsdk[1], 10) : null,
+              hasPackageJson: !!pkgTxt,
+              hasWww: fs.existsSync(path.join(rootDir, 'www')),
+              hasPlatformAndroid: fs.existsSync(path.join(rootDir, 'platforms', 'android')),
+            };
+          }
+
+          // ── main detection ─────────────────────────────────────────────────────────
+          function detect(srcDir) {
+            const files = walk(srcDir, 7);
+            const rel = (p) => path.relative(srcDir, p) || '.';
+            const top = (() => { try { return fs.readdirSync(srcDir).slice(0, 60); } catch (_) { return []; } })();
+
+            // Flutter
+            for (const f of files) {
+              if (f.name !== 'pubspec.yaml') continue;
+              const t = read(f.abs);
+              if (/sdk:\s*flutter/.test(t) && /^flutter:/m.test(t)) {
+                const androidDir = path.join(f.dir, 'android');
+                const hasAndroid = fs.existsSync(path.join(androidDir, 'app', 'build.gradle')) ||
+                                   fs.existsSync(path.join(androidDir, 'app', 'build.gradle.kts'));
+                const a = hasAndroid ? androidInfo(androidDir) : null;
+                let maxDart = null;
+                if (a && a.agp) {
+                  const av = vparse(a.agp);
+                  if (av[0] <= 4) maxDart = [2, 19];        // Flutter 3.7.x era
+                  else if (av[0] === 7) maxDart = [3, 5];   // Flutter 3.24.x era
+                }
+                const plan = planFlutter(f.dir, maxDart);
+                return {
+                  type: 'flutter', root: f.dir, relRoot: rel(f.dir), flutter: plan, hasAndroid,
+                  android: a, flavors: hasAndroid ? flutterFlavors(androidDir) : [],
+                  javaVersion: a ? a.javaVersion : 17, top,
+                };
+              }
+            }
+            // Cordova
+            for (const f of files) {
+              if (f.name !== 'config.xml') continue;
+              if (/[\\/]res[\\/]xml[\\/]/.test(f.abs)) continue;
+              const t = read(f.abs, 512 * 1024);
+              if (/<widget[\s>]/i.test(t)) {
+                const c = cordovaInfo(f.dir);
+                return { type: 'cordova', root: f.dir, relRoot: rel(f.dir), cordova: c, javaVersion: 17, top };
+              }
+            }
+            // Native Android
+            let cand = files.find(f => f.name === 'gradlew');
+            if (!cand) cand = files.find(f => f.name === 'settings.gradle' || f.name === 'settings.gradle.kts');
+            if (!cand) {
+              const app = files.find(f => /^build\.gradle(\.kts)?$/.test(f.name) &&
+                /com\.android\.application/.test(read(f.abs, 512 * 1024)));
+              if (app) {
+                // module dir -> if it is called "app" the gradle root is its parent
+                cand = { dir: path.basename(app.dir) === 'app' && app.dir !== srcDir ? path.dirname(app.dir) : app.dir };
+              }
+            }
+            if (cand) {
+              const a = androidInfo(cand.dir);
+              return { type: 'android', root: cand.dir, relRoot: rel(cand.dir), android: a, javaVersion: a.javaVersion, top };
+            }
+            return { type: 'unknown', root: srcDir, relRoot: '.', top };
+          }
+
+          // ── CLI ────────────────────────────────────────────────────────────────────
+          function main() {
+            const [cmd, arg] = process.argv.slice(2);
+            switch (cmd) {
+              case 'detect': process.stdout.write(JSON.stringify(detect(path.resolve(arg || '.')))); break;
+              case 'android': process.stdout.write(JSON.stringify(androidInfo(path.resolve(arg || '.')))); break;
+              case 'flutter-plan': process.stdout.write(JSON.stringify(planFlutter(path.resolve(arg || '.'), null))); break;
+              case 'flavors': process.stdout.write(JSON.stringify(flutterFlavors(path.resolve(arg || '.')))); break;
+              case 'cordova-java': process.stdout.write(String(javaForCordovaMajor(arg))); break;
+              case 'cordova-java-agp': process.stdout.write(String(javaForAgp(arg))); break;
+              case 'gradle-min': process.stdout.write(gradleMinForAgp(arg) || ''); break;
+              case 'vcmp': process.stdout.write(String(vcmp(process.argv[3], process.argv[4]))); break;
+              default:
+                process.stderr.write('usage: detect.js detect|android|flutter-plan|flavors|cordova-java|cordova-java-agp|gradle-min|vcmp <arg>\n');
+                process.exit(2);
+            }
+          }
+          if (require.main === module) main();
+          module.exports = { detect, androidInfo, planFlutter, parseConstraint, gradleMinForAgp, vcmp };
+          W2A_EOF_DETECT_JS
+
+      - name: Install CI toolkit (stages)
+        run: |
+          cat > "$W2A_HOME/stages/init.sh" <<'W2A_EOF_STAGES_INIT_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          w2a_section "Web2Apk CI — init"
+          echo "Runner : $(uname -srm)"
+          echo "Job ID : ${W2A_JOB_ID:-?}   User: ${W2A_USER_ID:-?}"
+          echo "Repo   : ${GITHUB_REPOSITORY:-?}   Run: ${GITHUB_RUN_ID:-?}"
+
+          printf '%s' "${W2A_PAYLOAD:-}" > "$W2A_HOME/payload.json"
+          if ! jq -e 'type=="object"' "$W2A_HOME/payload.json" >/dev/null 2>&1; then
+            w2a_error "Payload bukan JSON object yang valid. Isi (300 byte pertama): $(head -c 300 "$W2A_HOME/payload.json")"
+            exit 1
+          fi
+          echo "Payload:"
+          jq -r 'to_entries[] | "  \(.key) = \(.value | tostring | .[0:140])"' "$W2A_HOME/payload.json"
+
+          pj() { jq -r --arg k "$1" '(.[$k] // "") | tostring' "$W2A_HOME/payload.json" | tr -d '\r\n'; }
+
+          app_name="$(pj appName)"; [ -n "$app_name" ] || app_name="MyApp"
+          build_type="$(pj buildType | tr '[:upper:]' '[:lower:]')"; [ "$build_type" = "debug" ] || build_type="release"
+          app_safe="$(printf '%s' "$app_name" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-60)"; [ -n "$app_safe" ] || app_safe="app"
+
+          w2a_export APP_NAME "$app_name"
+          w2a_export APP_SAFE "$app_safe"
+          w2a_export BUILD_TYPE "$build_type"
+          w2a_export ZIP_ASSET_URL "$(pj zipAssetUrl)"
+          w2a_export ZIP_RELEASE_TAG "$(pj zipReleaseTag)"
+          w2a_export W2A_URL "$(pj url)"
+          w2a_export W2A_TYPE_HINT "$(pj projectType)"
+          w2a_export W2A_ENGINE "$(pj engine)"
+
+          # ── signing keystore (secrets are optional; otherwise a CI keystore is generated) ──
+          ks="$W2A_HOME/web2apk.keystore"
+          ks_pass="android"; ks_alias="web2apk"; key_pass="android"
+          use_secret=0
+          if [ -n "${W2A_SECRET_KS_B64:-}" ] && [ -n "${W2A_SECRET_KS_PASS:-}" ] && [ -n "${W2A_SECRET_KS_ALIAS:-}" ]; then
+            if printf '%s' "$W2A_SECRET_KS_B64" | base64 -d > "$ks" 2>/dev/null && \
+               keytool -list -keystore "$ks" -storepass "$W2A_SECRET_KS_PASS" -alias "$W2A_SECRET_KS_ALIAS" >/dev/null 2>&1; then
+              ks_pass="$W2A_SECRET_KS_PASS"; ks_alias="$W2A_SECRET_KS_ALIAS"; key_pass="${W2A_SECRET_KEY_PASS:-$W2A_SECRET_KS_PASS}"
+              use_secret=1
+              w2a_info "Memakai keystore dari repository secrets"
+            else
+              w2a_warn "Secret keystore ada tapi tidak valid -> memakai keystore CI otomatis"
+              rm -f "$ks"
+            fi
+          fi
+          if [ "$use_secret" = 0 ]; then
+            rm -f "$ks"
+            keytool -genkeypair -keystore "$ks" -alias "$ks_alias" -keyalg RSA -keysize 2048 -validity 36500 \
+              -storepass "$ks_pass" -keypass "$key_pass" -sigalg SHA256withRSA \
+              -dname "CN=Web2Apk, OU=CI, O=Web2Apk, C=ID" >/dev/null 2>&1
+            w2a_info "Keystore CI dibuat (signing otomatis untuk APK release)"
+          fi
+          w2a_export W2A_KEYSTORE "$ks"
+          w2a_export W2A_KS_PASS "$ks_pass"
+          w2a_export W2A_KS_ALIAS "$ks_alias"
+          w2a_export W2A_KEY_PASS "$key_pass"
+
+          w2a_section "Toolchain bawaan runner"
+          java -version 2>&1 | head -3 || true
+          node -v || true
+          echo "jq: $(jq --version)"
+          df -h / | tail -1
+          free -m 2>/dev/null | sed -n 1,2p || true
+          W2A_EOF_STAGES_INIT_SH
+          chmod +x "$W2A_HOME/stages/init.sh"
+          cat > "$W2A_HOME/stages/download.sh" <<'W2A_EOF_STAGES_DOWNLOAD_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          w2a_section "Download & deteksi project"
+          zip="$W2A_HOME/project.zip"; src="$W2A_HOME/src"
+          rm -rf "$src" "$zip"; mkdir -p "$src"
+
+          if [ -n "${ZIP_ASSET_URL:-}" ]; then
+            w2a_info "Mode: ZIP dari GitHub Release asset"
+            curl -fL --retry 5 --retry-delay 4 --retry-all-errors --connect-timeout 30 \
+              -H "Authorization: Bearer ${GH_TOKEN:-}" -H "Accept: application/octet-stream" \
+              -o "$zip" "$ZIP_ASSET_URL" || w2a_die "Gagal mengunduh ZIP dari release asset (cek token & permission contents:write)"
+          elif [ -n "${W2A_URL:-}" ]; then
+            w2a_info "Mode: unduh ZIP dari URL: $W2A_URL"
+            curl -fL --retry 3 --retry-delay 4 --connect-timeout 30 -o "$zip" "$W2A_URL" || w2a_die "Gagal mengunduh ZIP dari URL"
+          else
+            w2a_die "Payload tidak berisi zipAssetUrl maupun url"
+          fi
+
+          ls -lh "$zip"
+          if w2a_have file; then file "$zip" || true; fi
+          if ! unzip -tq "$zip" >/dev/null 2>&1; then
+            echo "--- 400 byte pertama file yang diunduh ---"; head -c 400 "$zip" || true; echo
+            w2a_die "File yang diunduh bukan ZIP valid / korup"
+          fi
+
+          set +e; unzip -q -o "$zip" -d "$src"; rc=$?; set -e
+          [ "$rc" -le 1 ] || w2a_die "unzip gagal (exit $rc)"
+          find "$src" -name '__MACOSX' -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$src" -name '.DS_Store' -delete 2>/dev/null || true
+
+          node "$W2A_DETECT" detect "$src" > "$W2A_HOME/detect.json"
+          type="$(jq -r .type "$W2A_HOME/detect.json")"
+          root="$(jq -r .root "$W2A_HOME/detect.json")"
+          echo "Hasil deteksi:"; jq '. | del(.top)' "$W2A_HOME/detect.json"
+
+          if [ "$type" = "unknown" ]; then
+            echo "--- struktur ZIP (maks 3 level) ---"
+            (cd "$src" && find . -maxdepth 3 -not -path '*/.git/*' | head -120)
+            w2a_die "Tipe project tidak dikenali. Pastikan ZIP berisi project Flutter (pubspec.yaml), Cordova (config.xml + www/) atau Android Studio (gradlew / build.gradle)."
+          fi
+          if [ -n "${W2A_TYPE_HINT:-}" ] && [ "$W2A_TYPE_HINT" != "$type" ]; then
+            w2a_warn "Bot mengira tipe '$W2A_TYPE_HINT' tetapi isi ZIP adalah '$type' -> memakai hasil deteksi workflow"
+          fi
+
+          w2a_export PROJECT_TYPE "$type"
+          w2a_export PROJECT_DIR "$root"
+          w2a_export W2A_JAVA "$(jq -r '.javaVersion // 17' "$W2A_HOME/detect.json")"
+          w2a_export W2A_FLUTTER_VERSION "$(jq -r '.flutter.version // "stable"' "$W2A_HOME/detect.json")"
+          w2a_info "Tipe: $type | Root: $(jq -r .relRoot "$W2A_HOME/detect.json") | JDK: $(jq -r '.javaVersion // 17' "$W2A_HOME/detect.json")"
+          W2A_EOF_STAGES_DOWNLOAD_SH
+          chmod +x "$W2A_HOME/stages/download.sh"
+          cat > "$W2A_HOME/stages/sdk.sh" <<'W2A_EOF_STAGES_SDK_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          w2a_section "Android SDK, lisensi & Gradle env"
+          w2a_ensure_sdk
+          w2a_write_gradle_env
+          w2a_accept_licenses
+          w2a_ensure_buildtools "34.0.0"
+          w2a_ensure_gradle
+          for k in compileSdk targetSdk; do
+            n="$(jq -r ".android.$k // empty" "$W2A_HOME/detect.json")"
+            [ -n "$n" ] && w2a_ensure_platform "$n"
+          done
+          echo "--- terpasang ---"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null | tr '\n' ' '; echo
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null | tr '\n' ' '; echo
+          java -version 2>&1 | head -1
+          gradle --version 2>/dev/null | sed -n 1,6p || true
+          W2A_EOF_STAGES_SDK_SH
+          chmod +x "$W2A_HOME/stages/sdk.sh"
+          cat > "$W2A_HOME/stages/flutter.sh" <<'W2A_EOF_STAGES_FLUTTER_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          cd "$PROJECT_DIR"
+          w2a_section "Flutter: persiapan project"
+          flutter config --no-analytics >/dev/null 2>&1 || true
+          flutter config --android-sdk "$ANDROID_HOME" >/dev/null 2>&1 || true
+          flutter --version
+
+          # artefak dari komputer pembuat ZIP yang sering bikin error
+          rm -rf build .dart_tool android/.gradle android/app/build android/local.properties android/.kotlin 2>/dev/null || true
+
+          # 1. template URL -> APK
+          if [ -f .web2apk-flutter-url ] && [ -f web2apk_bootstrap.sh ]; then
+            w2a_section "Flutter: bootstrap template URL"
+            FLUTTER_BIN=flutter bash web2apk_bootstrap.sh
+          fi
+
+          # 2. folder android/ tidak ada di ZIP -> generate
+          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            w2a_section "Flutter: folder android/ tidak ada -> flutter create"
+            pname="$(sed -nE 's/^name:[[:space:]]*["'\'']?([A-Za-z0-9_]+).*/\1/p' pubspec.yaml | head -1)"
+            [[ "$pname" =~ ^[a-z][a-z0-9_]*$ ]] || pname="web2apk_app"
+            cp pubspec.yaml "$W2A_HOME/pubspec.bak"
+            [ -f lib/main.dart ] && cp lib/main.dart "$W2A_HOME/main.bak"
+            flutter create --platforms=android --project-name "$pname" --org com.web2apk --no-pub .
+            cp "$W2A_HOME/pubspec.bak" pubspec.yaml
+            [ -f "$W2A_HOME/main.bak" ] && cp "$W2A_HOME/main.bak" lib/main.dart
+            rm -f "$W2A_HOME/pubspec.bak" "$W2A_HOME/main.bak"
+          fi
+          [ -f android/app/build.gradle ] || [ -f android/app/build.gradle.kts ] || w2a_die "android/app/build.gradle tidak ada setelah scaffold"
+
+          # 3. sanitasi gradle + wrapper sesuai AGP
+          w2a_section "Flutter: sanitasi Gradle & SDK"
+          w2a_sanitize_gradle_props android
+          w2a_ensure_keystore_props android
+          ainfo="$(node "$W2A_DETECT" android android)"
+          echo "$ainfo" | jq -c '{gradleVersion,agp,gradleMin,compileSdk,targetSdk,minSdk,javaVersion}'
+          w2a_fix_wrapper "$PWD/android" "$(echo "$ainfo" | jq -r '.gradleMin // empty')"
+          for k in compileSdk targetSdk; do
+            n="$(echo "$ainfo" | jq -r ".$k // empty")"
+            [ -n "$n" ] && w2a_ensure_platform "$n"
+          done
+          # compileSdk yang dipakai plugin Flutter (flutter.compileSdkVersion)
+          for n in $(grep -rhoE 'compileSdkVersion(: Int)?[[:space:]]*=[[:space:]]*[0-9]+' "$(dirname "$(dirname "$(command -v flutter)")")/packages/flutter_tools/gradle" 2>/dev/null | grep -oE '[0-9]+$' | sort -u); do
+            w2a_ensure_platform "$n"
+          done
+
+          # 4. dependencies
+          w2a_retry "flutter pub get" flutter pub get
+          w2a_write_local_properties android
+
+          # 5. launcher icons (opsional, sama seperti pipeline VPS)
+          if grep -q '^flutter_launcher_icons:' pubspec.yaml 2>/dev/null; then
+            w2a_section "Flutter: generate launcher icons"
+            (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons) || w2a_warn "generate icon gagal (diabaikan)"
+          fi
+          find android/app/src/main/res -path '*mipmap-*' -name 'ic_launcher*' -size 0 -delete 2>/dev/null || true
+
+          # 6. build
+          w2a_section "Flutter: build APK ($BUILD_TYPE)"
+          args=(build apk "--$BUILD_TYPE" -v)
+          help_txt="$(flutter build apk --help 2>&1 || true)"
+          if [ "$BUILD_TYPE" = "release" ] && grep -q -- '--no-tree-shake-icons' <<<"$help_txt"; then
+            args+=(--no-tree-shake-icons)
+          fi
+          flavor="$(node "$W2A_DETECT" flavors android | jq -r '.[0] // empty')"
+          if [ -n "$flavor" ]; then
+            w2a_warn "Project punya productFlavors -> memakai --flavor $flavor"
+            args+=(--flavor "$flavor")
+          fi
+          w2a_retry "flutter ${args[*]}" flutter "${args[@]}"
+          W2A_EOF_STAGES_FLUTTER_SH
+          chmod +x "$W2A_HOME/stages/flutter.sh"
+          cat > "$W2A_HOME/stages/native.sh" <<'W2A_EOF_STAGES_NATIVE_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          cd "$PROJECT_DIR"
+          w2a_section "Android native: persiapan project"
+          ainfo="$(node "$W2A_DETECT" android "$PWD")"
+          echo "$ainfo" | jq -c '{gradleVersion,agp,gradleMin,compileSdk,targetSdk,minSdk,appModules,javaVersion,hasGradlew,hasWrapperJar}'
+
+          rm -rf .gradle build app/build 2>/dev/null || true
+          w2a_sanitize_gradle_props "$PWD"
+          w2a_ensure_keystore_props "$PWD"
+          w2a_fix_wrapper "$PWD" "$(echo "$ainfo" | jq -r '.gradleMin // empty')"
+          w2a_write_local_properties "$PWD"
+          for k in compileSdk targetSdk; do
+            n="$(echo "$ainfo" | jq -r ".$k // empty")"
+            [ -n "$n" ] && w2a_ensure_platform "$n"
+          done
+
+          if [ "$BUILD_TYPE" = "debug" ]; then task="assembleDebug"; else task="assembleRelease"; fi
+          w2a_section "Android native: ./gradlew $task"
+          w2a_retry "gradlew $task" ./gradlew "$task" --no-daemon --stacktrace --console=plain
+          W2A_EOF_STAGES_NATIVE_SH
+          chmod +x "$W2A_HOME/stages/native.sh"
+          cat > "$W2A_HOME/stages/cordova_prepare.sh" <<'W2A_EOF_STAGES_CORDOVA_PREPARE_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          cd "$PROJECT_DIR"
+          export CI=true
+          w2a_section "Cordova: persiapan project"
+          cinfo="$(jq -c '.cordova' "$W2A_HOME/detect.json")"
+          echo "$cinfo"
+          if [ ! -d www ]; then
+            echo "--- isi folder project ---"; ls -la
+            w2a_die "Folder www/ tidak ditemukan di root project Cordova. Build web dulu (mis. npm run build) lalu zip termasuk folder www/."
+          fi
+
+          cli_major="$(echo "$cinfo" | jq -r '.cliMajor // empty')"
+          spec="cordova"; [ -n "$cli_major" ] && spec="cordova@$cli_major"
+          w2a_retry "npm install -g $spec" npm install -g "$spec" --no-audit --no-fund
+          cordova --version
+          cordova telemetry off >/dev/null 2>&1 || true
+          w2a_ensure_gradle
+
+          if [ -f package.json ]; then
+            w2a_section "Cordova: npm install (dependency project)"
+            npm install --no-audit --no-fund --legacy-peer-deps || w2a_warn "npm install gagal (dilanjutkan, plugin akan diambil cordova)"
+          fi
+
+          # build.json yang menunjuk keystore yang tidak ada akan memutus build release
+          if [ -f build.json ]; then
+            missing="$(jq -r '.. | .keystore? // empty' build.json 2>/dev/null | while read -r k; do [ -f "$k" ] || echo "$k"; done || true)"
+            if [ -n "$missing" ]; then
+              w2a_warn "build.json menunjuk keystore yang tidak ada ($missing) -> build.json dinonaktifkan, APK akan di-sign oleh CI"
+              mv build.json build.json.disabled
+            fi
+          fi
+
+          w2a_section "Cordova: tambah platform android"
+          rm -rf platforms/android
+          if ! w2a_retry "cordova platform add android" cordova platform add android --verbose; then
+            w2a_warn "platform add memakai versi dari project gagal -> mencoba cordova-android terbaru"
+            rm -rf platforms/android
+            w2a_retry "cordova platform add android@latest" cordova platform add android@latest --verbose
+          fi
+
+          ver="$(cordova platform ls 2>/dev/null | sed -nE 's/^[[:space:]]*android[[:space:]]+([0-9][0-9.]*).*/\1/p' | head -1 || true)"
+          if [ -z "$ver" ] && [ -f platforms/android/cordova/version ]; then
+            ver="$(node platforms/android/cordova/version 2>/dev/null | tr -d '\r\n' || true)"
+          fi
+          major="${ver%%.*}"
+          w2a_info "cordova-android terpasang: ${ver:-tidak diketahui}"
+
+          if [ -n "$major" ] && [ "$major" -lt 9 ] 2>/dev/null; then
+            w2a_warn "cordova-android $ver terlalu lama untuk Android SDK modern -> memakai cordova-android 9.1.0"
+            rm -rf platforms/android
+            w2a_retry "cordova platform add android@9.1.0" cordova platform add android@9.1.0 --verbose
+            ver="9.1.0"; major=9
+          fi
+
+          sdk=""; bt=""; agp=""; minsdk=""
+          cfg="platforms/android/cdv-gradle-config.json"
+          if [ -f "$cfg" ]; then
+            cat "$cfg"
+            sdk="$(jq -r '.SDK_VERSION // empty' "$cfg")"
+            bt="$(jq -r '.MIN_BUILD_TOOLS // empty' "$cfg")"
+            agp="$(jq -r '.AGP_VERSION // empty' "$cfg")"
+            minsdk="$(jq -r '.MIN_SDK_VERSION // empty' "$cfg")"
+          else
+            case "$major" in 9) sdk=29; bt="29.0.2";; esac
+          fi
+
+          # preference lama di config.xml (mis. targetSdk 34) menurunkan compileSdk di bawah kebutuhan androidx
+          pref_t="$(grep -oE 'android-targetSdkVersion"[[:space:]]+value="[0-9]+' config.xml 2>/dev/null | grep -oE '[0-9]+$' | head -1 || true)"
+          pref_m="$(grep -oE 'android-minSdkVersion"[[:space:]]+value="[0-9]+' config.xml 2>/dev/null | grep -oE '[0-9]+$' | head -1 || true)"
+          if [ -n "$pref_t" ] && [ -n "$sdk" ] && [ "$pref_t" -lt "$sdk" ]; then
+            w2a_warn "android-targetSdkVersion=$pref_t < default platform ($sdk) -> preference dihapus agar kompatibel dengan AndroidX"
+            sed -i -E '/android-targetSdkVersion/d' config.xml
+          fi
+          if [ -n "$pref_m" ] && [ -n "$minsdk" ] && [ "$pref_m" -lt "$minsdk" ]; then
+            w2a_warn "android-minSdkVersion=$pref_m < minimum platform ($minsdk) -> preference dihapus"
+            sed -i -E '/android-minSdkVersion/d' config.xml
+          fi
+
+          if [ -n "$agp" ]; then j="$(node "$W2A_DETECT" cordova-java-agp "$agp")"; else j="$(node "$W2A_DETECT" cordova-java "${major:-0}")"; fi
+          w2a_export W2A_JAVA2 "$j"
+          w2a_export W2A_CORDOVA_MAJOR "${major:-0}"
+          w2a_info "JDK yang dipakai untuk build: $j"
+
+          w2a_accept_licenses
+          [ -n "$sdk" ] && w2a_ensure_platform "$sdk"
+          [ -n "$bt" ]  && w2a_ensure_buildtools "$bt"
+          true
+          W2A_EOF_STAGES_CORDOVA_PREPARE_SH
+          chmod +x "$W2A_HOME/stages/cordova_prepare.sh"
+          cat > "$W2A_HOME/stages/cordova_build.sh" <<'W2A_EOF_STAGES_CORDOVA_BUILD_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          cd "$PROJECT_DIR"
+          export CI=true
+          w2a_section "Cordova: requirements"
+          java -version 2>&1 | head -1
+          cordova requirements android || w2a_warn "cordova requirements melaporkan masalah (lanjut build agar error lengkap terekam)"
+
+          w2a_retry "cordova prepare android" cordova prepare android --verbose
+
+          args=(build android "--$BUILD_TYPE" --verbose)
+          if [ "${W2A_CORDOVA_MAJOR:-0}" -ge 7 ] 2>/dev/null; then
+            args+=(-- --packageType=apk --gradleArg=--stacktrace)
+          fi
+          w2a_retry "cordova ${args[*]}" cordova "${args[@]}"
+          W2A_EOF_STAGES_CORDOVA_BUILD_SH
+          chmod +x "$W2A_HOME/stages/cordova_build.sh"
+          cat > "$W2A_HOME/stages/finish.sh" <<'W2A_EOF_STAGES_FINISH_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh"
+
+          w2a_section "Cari APK, signing & verifikasi"
+          apk="$(w2a_pick_apk "$PROJECT_DIR")"
+          if [ -z "$apk" ]; then
+            w2a_error "APK tidak ditemukan setelah build selesai"
+            echo "--- semua .apk/.aab di project ---"
+            find "$PROJECT_DIR" \( -name '*.apk' -o -name '*.aab' \) -type f 2>/dev/null | head -50
+            w2a_die "Build selesai tanpa menghasilkan APK. Jika project hanya membuat .aab, ubah ke assembleRelease/apk."
+          fi
+          w2a_info "Kandidat APK: $apk ($(du -h "$apk" | cut -f1))"
+
+          out="$W2A_HOME/out"; rm -rf "$out"; mkdir -p "$out"
+          final="$out/${APP_SAFE}-${BUILD_TYPE}.apk"
+          signer="$(w2a_buildtool apksigner)"; aligner="$(w2a_buildtool zipalign)"
+          [ -n "$signer" ] || w2a_die "apksigner tidak ditemukan di build-tools"
+
+          if "$signer" verify "$apk" >/dev/null 2>&1; then
+            w2a_info "APK sudah ter-sign oleh project"
+            cp "$apk" "$final"
+          else
+            w2a_info "APK belum ter-sign (unsigned) -> zipalign + sign dengan keystore CI"
+            tmp="$W2A_HOME/aligned.apk"; rm -f "$tmp"
+            if [ -n "$aligner" ] && "$aligner" -f -p 4 "$apk" "$tmp"; then :; else cp "$apk" "$tmp"; fi
+            "$signer" sign --ks "$W2A_KEYSTORE" --ks-key-alias "$W2A_KS_ALIAS" \
+              --ks-pass "pass:$W2A_KS_PASS" --key-pass "pass:$W2A_KEY_PASS" --out "$final" "$tmp"
+            rm -f "$tmp" "$final.idsig"
+          fi
+          "$signer" verify --print-certs "$final" | head -6
+          aapt="$(w2a_buildtool aapt)"
+          [ -n "$aapt" ] && "$aapt" dump badging "$final" 2>/dev/null | grep -E "^(package|sdkVersion|targetSdkVersion|application-label:)" | head -5 || true
+          sha="$(sha256sum "$final" | cut -d' ' -f1)"
+          size="$(du -h "$final" | cut -f1)"
+          w2a_export W2A_APK "$final"
+          {
+            echo "### APK siap"
+            echo "- Tipe project: \`$PROJECT_TYPE\`  |  Build: \`$BUILD_TYPE\`"
+            echo "- File: \`$(basename "$final")\` ($size)"
+            echo "- SHA-256: \`$sha\`"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          w2a_info "APK final: $final ($size)"
+          W2A_EOF_STAGES_FINISH_SH
+          chmod +x "$W2A_HOME/stages/finish.sh"
+          cat > "$W2A_HOME/stages/diagnostics.sh" <<'W2A_EOF_STAGES_DIAGNOSTICS_SH'
+          #!/usr/bin/env bash
+          # jalan saat build gagal: tambahkan informasi lingkungan ke log yang dikirim ke bot
+          set +e
+          # shellcheck source=/dev/null
+          source "$W2A_HOME/lib.sh" 2>/dev/null
+
+          w2a_section "DIAGNOSTIK LINGKUNGAN (build gagal)"
+          echo "PROJECT_TYPE=${PROJECT_TYPE:-?}  BUILD_TYPE=${BUILD_TYPE:-?}  JAVA(plan)=${W2A_JAVA:-?}/${W2A_JAVA2:-}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          java -version 2>&1 | head -3
+          echo "JAVA_HOME=${JAVA_HOME:-}"
+          node -v 2>/dev/null; npm -v 2>/dev/null
+          gradle --version 2>/dev/null | sed -n 1,8p
+          echo "--- SDK platforms / build-tools ---"
+          ls "${ANDROID_HOME:-/x}/platforms" 2>/dev/null | tr '\n' ' '; echo
+          ls "${ANDROID_HOME:-/x}/build-tools" 2>/dev/null | tr '\n' ' '; echo
+          echo "--- disk / memori ---"
+          df -h / | tail -1; free -m 2>/dev/null | sed -n 1,2p
+          echo "--- ~/.gradle/gradle.properties ---"
+          cat "$HOME/.gradle/gradle.properties" 2>/dev/null
+          if [ "${PROJECT_TYPE:-}" = "flutter" ] && command -v flutter >/dev/null 2>&1; then
+            echo "--- flutter doctor -v ---"; flutter doctor -v 2>&1 | head -80
+          fi
+          if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+            echo "--- isi root project ($PROJECT_DIR) ---"; ls -la "$PROJECT_DIR" | head -60
+            for f in "$PROJECT_DIR/android/gradle/wrapper/gradle-wrapper.properties" "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" \
+                     "$PROJECT_DIR/platforms/android/gradle/wrapper/gradle-wrapper.properties" "$PROJECT_DIR/platforms/android/cdv-gradle-config.json"; do
+              [ -f "$f" ] && { echo "--- $f ---"; cat "$f"; }
+            done
+          fi
+          echo "--- hs_err / crash log JVM ---"
+          find "${PROJECT_DIR:-.}" "$HOME" -maxdepth 4 -name 'hs_err_pid*.log' 2>/dev/null | head -3 | while read -r f; do echo "## $f"; head -40 "$f"; done
+          echo "--- Gradle daemon log (tail) ---"
+          for f in $(ls -t "$HOME"/.gradle/daemon/*/daemon-*.out.log 2>/dev/null | head -1); do tail -80 "$f"; done
+          true
+          W2A_EOF_STAGES_DIAGNOSTICS_SH
+          chmod +x "$W2A_HOME/stages/diagnostics.sh"
+
+      - name: 1. Init (payload, keystore)
+        env:
+          W2A_PAYLOAD: ${{ inputs.payload }}
+          W2A_JOB_ID: ${{ inputs.jobId }}
+          W2A_USER_ID: ${{ inputs.userId }}
+          W2A_SECRET_KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          W2A_SECRET_KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          W2A_SECRET_KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          W2A_SECRET_KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bash "$W2A_HOME/stages/init.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      - name: 2. Download ZIP & detect project type
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash "$W2A_HOME/stages/download.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      - name: 3a. Setup JDK 17 (base, needed by sdkmanager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 3b. Setup JDK for this project
+        if: env.W2A_JAVA != '17'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.W2A_JAVA }}
+
+      - name: 4. Android SDK, licenses, Gradle env
+        run: bash "$W2A_HOME/stages/sdk.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      # ───────────── FLUTTER ─────────────
+      - name: 5a. Setup Flutter (pinned by project)
+        if: env.PROJECT_TYPE == 'flutter' && env.W2A_FLUTTER_VERSION != 'stable'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.W2A_FLUTTER_VERSION }}
+          cache: true
+
+      - name: 5b. Setup Flutter (latest stable)
+        if: env.PROJECT_TYPE == 'flutter' && env.W2A_FLUTTER_VERSION == 'stable'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 6. Flutter - prepare & build APK
+        if: env.PROJECT_TYPE == 'flutter'
+        run: bash "$W2A_HOME/stages/flutter.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      # ───────────── ANDROID NATIVE ─────────────
+      - name: 6. Android native - prepare & build APK
+        if: env.PROJECT_TYPE == 'android'
+        run: bash "$W2A_HOME/stages/native.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      # ───────────── CORDOVA ─────────────
+      - name: 6a. Cordova - CLI, platform android, plan SDK/JDK
+        if: env.PROJECT_TYPE == 'cordova'
+        run: bash "$W2A_HOME/stages/cordova_prepare.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      - name: 6b. Cordova - switch JDK if platform needs another
+        if: env.PROJECT_TYPE == 'cordova' && env.W2A_JAVA2 != '' && env.W2A_JAVA2 != '17'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.W2A_JAVA2 }}
+
+      - name: 6c. Cordova - build APK
+        if: env.PROJECT_TYPE == 'cordova'
+        run: bash "$W2A_HOME/stages/cordova_build.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      # ───────────── FINISH ─────────────
+      - name: 7. Find APK, sign & verify
+        run: bash "$W2A_HOME/stages/finish.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      - name: 8. Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: /home/runner/w2a/out/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      # ───────────── ON FAILURE: kirim log lengkap ke bot ─────────────
+      - name: Collect diagnostics (failure only)
+        if: failure()
+        run: bash "$W2A_HOME/stages/diagnostics.sh" 2>&1 | tee -a "$W2A_LOG"
+
+      - name: Upload full build log (failure only)
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.jobId }}
+          path: /home/runner/w2a/logs/build_log.txt
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Cleanup temporary release asset
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.ZIP_RELEASE_TAG }}
+        run: |
+          if [ -n "${TAG:-}" ]; then
+            echo "Cleaning up temporary release: $TAG"
+            gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          fi
