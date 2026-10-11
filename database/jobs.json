@@ -1,0 +1,13 @@
+{
+  "mv3q1cx2jb2a0": {
+    "job_id": "mv3q1cx2jb2a0",
+    "release_id": 409615393,
+    "release_tag": "build-mv3q1cx2jb2a0",
+    "run_id": 38134560961,
+    "user_id": 8756694861,
+    "analyze_only": false,
+    "build_type": "release",
+    "status": "pending",
+    "created_at": "2026-10-11T11:10:03.138Z"
+  }
+}
