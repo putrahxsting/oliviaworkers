@@ -988,6 +988,16 @@ jobs:
             (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons) || w2a_warn "generate icon gagal (diabaikan)"
           fi
           find android/app/src/main/res -path '*mipmap-*' -name 'ic_launcher*' -size 0 -delete 2>/dev/null || true
+          # Dedupe ikon: jika ic_launcher.png dan .jpg sama-sama ada (nama resource bentrok),
+          # pakai .png dan buang .jpg. Jika hanya .jpg yang ada, dibiarkan (valid di Android).
+          for w2a_d in android/app/src/main/res/mipmap-*; do
+            [ -d "$w2a_d" ] || continue
+            for w2a_f in "$w2a_d"/ic_launcher*.jpg "$w2a_d"/ic_launcher*.jpeg; do
+              [ -f "$w2a_f" ] || continue
+              w2a_b="${w2a_f%.*}"
+              if [ -f "$w2a_b.png" ]; then echo "Removing duplicate icon: $w2a_f (png exists)"; rm -f "$w2a_f"; fi
+            done
+          done
 
           # 6. build
           w2a_section "Flutter: build APK ($BUILD_TYPE)"
