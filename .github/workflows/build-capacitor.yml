@@ -1353,16 +1353,22 @@ jobs:
           if [ "${core_major:-0}" -ge 7 ] 2>/dev/null; then
             [ "$j" -ge 21 ] 2>/dev/null || j=21
           fi
-          if grep -rqsE 'JavaVersion\.VERSION_21|JavaLanguageVersion\.of\(21\)' android/app/capacitor.build.gradle node_modules/@capacitor/android/capacitor/build.gradle; then
-            [ "$j" -ge 21 ] 2>/dev/null || j=21
+          # versi Java tertinggi yang diminta Gradle project / plugin (dibulatkan ke LTS: 17, 21, 25)
+          req="$(grep -rhoE 'JavaVersion\.VERSION_[0-9]+|JavaLanguageVersion\.of\([0-9]+\)' android/app/capacitor.build.gradle android/app/build.gradle android/build.gradle node_modules/@capacitor/android/capacitor/build.gradle 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1 || true)"
+          if [ -n "$req" ] && [ "$req" -gt 17 ] 2>/dev/null; then
+            if [ "$req" -gt 21 ]; then req=25; else req=21; fi
+            [ "$j" -ge "$req" ] 2>/dev/null || j="$req"
           fi
           w2a_export W2A_JAVA2 "$j"
           w2a_info "JDK yang dipakai untuk build: $j"
 
-          # Gradle < 8.5 tidak bisa berjalan di JDK 21
+          # Gradle < 8.5 tidak bisa berjalan di JDK 21, dan < 9.1 tidak di JDK 25
           gmin="$(echo "$ainfo" | jq -r '.gradleMin // empty')"
-          if [ "$j" -ge 21 ] 2>/dev/null; then
-            if [ -z "$gmin" ] || [ "$(w2a_vcmp "$gmin" "8.5")" = "-1" ]; then gmin="8.5"; fi
+          gneed=""
+          [ "$j" -ge 21 ] 2>/dev/null && gneed="8.5"
+          [ "$j" -ge 25 ] 2>/dev/null && gneed="9.1.0"
+          if [ -n "$gneed" ]; then
+            if [ -z "$gmin" ] || [ "$(w2a_vcmp "$gmin" "$gneed")" = "-1" ]; then gmin="$gneed"; fi
           fi
           w2a_fix_wrapper "$PWD/android" "$gmin"
           w2a_write_local_properties android
@@ -1377,6 +1383,13 @@ jobs:
             if [ ! -d "$ANDROID_HOME/ndk/$n" ]; then
               w2a_info "Menginstall ndk;$n"
               w2a_sdkm "ndk;$n" >/dev/null 2>&1 || w2a_warn "gagal install ndk;$n (AGP akan mencoba mengunduh sendiri)"
+            fi
+          done
+          # versi CMake yang diminta project (externalNativeBuild)
+          for n in $(grep -rhoE "cmake[^}]*version[[:space:]]*=?[[:space:]]*[\"'][0-9]+\.[0-9]+(\.[0-9]+)?[\"']" android/app/build.gradle android/app/build.gradle.kts 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -u); do
+            if [ ! -d "$ANDROID_HOME/cmake/$n" ]; then
+              w2a_info "Menginstall cmake;$n"
+              w2a_sdkm "cmake;$n" >/dev/null 2>&1 || w2a_warn "gagal install cmake;$n (AGP akan mencoba mengunduh sendiri)"
             fi
           done
           true
